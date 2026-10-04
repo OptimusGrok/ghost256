@@ -63,28 +63,24 @@ function lsSet(k,v){try{window.localStorage.setItem(k,v);}catch(e){}}
 function mkRng(seed){var s=seed>>>0;return function(){s=(s+0x6D2B79F5)>>>0;var t=s;t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296;};}
 var rnd=mkRng((Date.now()^0x9e3779b9)>>>0);
 
-/* ===================== maze (infinite, Eller-style strip generation in any of 4 directions) ===================== */
-/* World = global tile lattice: cells sit on (odd,odd) tiles, walls/passages on the rest. Tiles live in a 64x64 toroidal
-   buffer; the "rect" [x0..x1]x[y0..y1] is the currently valid region (never larger than 64 in either axis).
-   Vertical phases (up/down) are 19 tiles wide and generate rows ahead; horizontal phases (left/right) are 33 tiles tall
-   and generate columns ahead. A direction switch re-bases the rect on the current (aligned) view window, repairs it
-   (closes borders, removes dead ends, merges components) and continues Eller's algorithm from that seam. */
+/* ===================== maze: one continuous world, extended lazily on any side ===================== */
+/* World = global tile lattice: cells sit on (odd,odd) tiles, walls/passages on the rest.  Tiles/items live in a 64x64
+   toroidal buffer; the "rect" [x0..x1]x[y0..y1] (x0,x1,y0,y1 even = closed wall lines, never larger than 64 tiles per axis)
+   is the currently valid world.  M.extend(side,K) adds K cell lines on any side: the strip is an internally connected maze
+   (random spanning tree + extra loops, no dead ends) joined to the old border by several openings.  When the rect would
+   grow beyond 64 tiles, lines on the opposite (far) side are discarded and the remainder is repaired (closed border,
+   no dead ends, one connected component).  There is no wrap-around: the world is open on all sides. */
 var M={
   tiles:new Uint8Array(4096), items:new Uint8Array(4096),
-  x0:0,x1:18,y0:0,y1:0,vert:true,d:0,lead:0,sgn:-1,a0:0,n:9,
-  nextSet:1,rnd:null,powerCd:3,cnt:0,
-  sets:new Int32Array(18),fwd:new Uint8Array(18),pf:new Uint8Array(18),hl:new Uint8Array(18),tmp:new Uint8Array(18),opt:new Uint8Array(3),
+  x0:0,x1:18,y0:0,y1:0,rnd:null,powerAcc:0,powerNext:120,gens:0,trims:0,
   reset:function(seed){
-    this.tiles.fill(1);this.items.fill(0);this.x0=0;this.x1=18;this.y0=0;this.y1=0;this.vert=true;this.d=0;this.lead=0;this.sgn=-1;
-    this.a0=0;this.n=9;this.nextSet=1;this.powerCd=3;this.cnt=0;this.pf.fill(0);this.fwd.fill(0);this.hl.fill(0);this.sets.fill(0);
-    this.rnd=mkRng(seed);
+    this.tiles.fill(1);this.items.fill(0);this.x0=0;this.x1=18;this.y0=0;this.y1=0;
+    this.rnd=mkRng(seed);this.powerAcc=0;this.powerNext=120;this.gens=0;this.trims=0;
   },
-  wx:function(x){if(this.vert){if(x<this.x0)return x+19;if(x>this.x1)return x-19;}return x;},
-  wy:function(y){if(!this.vert){if(y<this.y0)return y+33;if(y>this.y1)return y-33;}return y;},
+  wx:function(x){return x;},
+  wy:function(y){return y;},
   inRect:function(x,y){return x>=this.x0&&x<=this.x1&&y>=this.y0&&y<=this.y1;},
   open:function(x,y){
-    if(this.vert){if(x<this.x0)x+=19;else if(x>this.x1)x-=19;}
-    else{if(y<this.y0)y+=33;else if(y>this.y1)y-=33;}
     if(x<this.x0||x>this.x1||y<this.y0||y>this.y1)return false;
     return this.tiles[(x&63)|((y&63)<<6)]===0;
   },
@@ -92,118 +88,126 @@ var M={
     if(x<this.x0||x>this.x1||y<this.y0||y>this.y1)return 0;
     return this.items[(x&63)|((y&63)<<6)];
   },
-  put:function(u,v,val){
-    var x=this.vert?v:u,y=this.vert?u:v,i=(x&63)|((y&63)<<6);
-    this.tiles[i]=val;if(val)this.items[i]=0;
+  /* discard n (even) lines on side s (0 top,1 left,2 bottom,3 right) and close the new border */
+  trim:function(s,n){
+    var x,y,t=this.tiles,it=this.items,k;
+    if(s===0)this.y0+=n;else if(s===2)this.y1-=n;else if(s===1)this.x0+=n;else this.x1-=n;
+    if(s===0||s===2){y=(s===0)?this.y0:this.y1;for(x=this.x0;x<=this.x1;x++){k=(x&63)|((y&63)<<6);t[k]=1;it[k]=0;}}
+    else{x=(s===1)?this.x0:this.x1;for(y=this.y0;y<=this.y1;y++){k=(x&63)|((y&63)<<6);t[k]=1;it[k]=0;}}
+    this.trims++;
   },
-  gen:function(){
-    var cl=this.lead,sg=this.sgn,rl=cl+sg,a0=this.a0,n=this.n,r=this.rnd,c,j,q,m,v,i;
-    var sets=this.sets,fwd=this.fwd,pf=this.pf,hl=this.hl,tmp=this.tmp,opt=this.opt;
-    for(v=a0;v<=a0+2*n;v++){this.put(cl,v,1);this.put(rl,v,1);}
-    for(c=0;c<n;c++){if(pf[c])this.put(cl,a0+2*c+1,0);else sets[c]=this.nextSet++;}
-    for(c=0;c<n-1;c++){
-      hl[c]=0;var a=sets[c],b=sets[c+1];
-      if(a!==b){if(r()<0.6){hl[c]=1;for(j=0;j<n;j++)if(sets[j]===b)sets[j]=a;}}
-      else if(r()<0.2)hl[c]=1;
-    }
-    for(c=0;c<n;c++)fwd[c]=0;
-    for(c=0;c<n;c++){
-      var s=sets[c],first=true;
-      for(j=0;j<c;j++)if(sets[j]===s){first=false;break;}
-      if(!first)continue;
-      m=0;for(j=c;j<n;j++)if(sets[j]===s)tmp[m++]=j;
-      fwd[tmp[(r()*m)|0]]=1;
-      for(q=0;q<m;q++)if(r()<0.35)fwd[tmp[q]]=1;
-    }
-    var tun=(this.cnt>=1&&r()<0.14)?1:0;
-    for(c=0;c<n;c++){
-      var cnt=(pf[c]?1:0)+((c>0&&hl[c-1])?1:0)+((c<n-1&&hl[c])?1:0)+fwd[c]+((c===0&&tun)?1:0)+((c===n-1&&tun)?1:0);
-      if(cnt<=1){
-        m=0;
-        if(c>0&&!hl[c-1])opt[m++]=0;
-        if(c<n-1&&!hl[c])opt[m++]=1;
-        if(!fwd[c])opt[m++]=2;
-        if(m>0){var o=opt[(r()*m)|0];if(o===0)hl[c-1]=1;else if(o===1)hl[c]=1;else fwd[c]=1;}
+  /* no dead ends + one connected component over the whole rect (used after a trim cut passages) */
+  repair:function(){
+    var NX=(this.x1-this.x0)>>1,NY=(this.y1-this.y0)>>1,t=this.tiles,it=this.items,r=this.rnd,x0=this.x0,y0=this.y0,i,j,k,q;
+    if(NX<1||NY<1)return;
+    function K(x,y){return (x&63)|((y&63)<<6);}
+    function opn(x,y){var z=K(x,y);t[z]=0;if(!it[z])it[z]=1;}
+    var DXs=[0,-1,0,1],DYs=[-1,0,1,0],cand=[0,0,0,0];
+    for(j=0;j<NY;j++)for(i=0;i<NX;i++){
+      var cx=x0+2*i+1,cy=y0+2*j+1,deg=0,m=0;
+      for(k=0;k<4;k++){
+        if(t[K(cx+DXs[k],cy+DYs[k])]===0)deg++;
+        else{var ni=i+DXs[k],nj=j+DYs[k];if(ni>=0&&ni<NX&&nj>=0&&nj<NY)cand[m++]=k;}
       }
+      while(deg<2&&m>0){q=(r()*m)|0;k=cand[q];cand[q]=cand[--m];opn(cx+DXs[k],cy+DYs[k]);deg++;}
     }
-    for(c=0;c<n;c++){
-      this.put(rl,a0+2*c+1,0);
-      if(c<n-1&&hl[c])this.put(rl,a0+2*c+2,0);
-    }
-    if(tun){this.put(rl,a0,0);this.put(rl,a0+2*n,0);}
-    for(v=a0;v<=a0+2*n;v++){
-      for(i=0;i<2;i++){
-        var u=i?rl:cl,x=this.vert?v:u,y=this.vert?u:v,k=(x&63)|((y&63)<<6);
-        if(this.tiles[k]===0)this.items[k]=1;
-      }
-    }
-    if(this.cnt>=3){if(--this.powerCd<=0){c=(r()*n)|0;var pu=rl,pv=a0+2*c+1,px=this.vert?pv:pu,py=this.vert?pu:pv;this.items[(px&63)|((py&63)<<6)]=2;this.powerCd=8+((r()*7)|0);}}
-    for(c=0;c<n;c++)pf[c]=fwd[c];
-    this.lead=cl+2*sg;this.cnt++;
-    var d=this.d;
-    if(d===0){this.y0=rl;this.y1=Math.min(this.y1,rl+63);}
-    else if(d===2){this.y1=rl;this.y0=Math.max(this.y0,rl-63);}
-    else if(d===1){this.x0=rl;this.x1=Math.min(this.x1,rl+63);}
-    else{this.x1=rl;this.x0=Math.max(this.x0,rl-63);}
-  },
-  /* re-base on the aligned 19x33 window (wx0,wy0 even) and continue generating in direction d */
-  switchTo:function(d,wx0,wy0){
-    var x0=wx0,x1=wx0+18,y0=wy0,y1=wy0+32,x,y,i,j,k,r=this.rnd,t=this.tiles,it=this.items,NC=9,NR=16;
-    for(y=y0;y<=y1;y++)for(x=x0;x<=x1;x++){
-      if(!(x>=this.x0&&x<=this.x1&&y>=this.y0&&y<=this.y1)){k=(x&63)|((y&63)<<6);t[k]=((x&1)&&(y&1))?0:1;it[k]=0;}
-    }
-    this.x0=x0;this.x1=x1;this.y0=y0;this.y1=y1;this.d=d;this.vert=(d===0||d===2);
-    for(x=x0;x<=x1;x++){k=(x&63)|((y0&63)<<6);t[k]=1;it[k]=0;k=(x&63)|((y1&63)<<6);t[k]=1;it[k]=0;}
-    for(y=y0;y<=y1;y++){k=(x0&63)|((y&63)<<6);t[k]=1;it[k]=0;k=(x1&63)|((y&63)<<6);t[k]=1;it[k]=0;}
-    function kx(px,py){return (px&63)|((py&63)<<6);}
-    function isOpen(px,py){return t[kx(px,py)]===0;}
-    function opn(px,py){var q=kx(px,py);t[q]=0;if(!it[q])it[q]=1;}
-    // right link of cell (i,j) at (x0+2i+2,y0+2j+1); down link at (x0+2i+1,y0+2j+2)
-    var cnt;
-    for(j=0;j<NR;j++)for(i=0;i<NC;i++){
-      var cxp=x0+2*i+1,cyp=y0+2*j+1;
-      cnt=(i<NC-1&&isOpen(cxp+1,cyp)?1:0)+(i>0&&isOpen(cxp-1,cyp)?1:0)+(j<NR-1&&isOpen(cxp,cyp+1)?1:0)+(j>0&&isOpen(cxp,cyp-1)?1:0);
-      if(cnt<=1){
-        var cand=[];
-        if(i<NC-1&&!isOpen(cxp+1,cyp))cand.push(0);
-        if(i>0&&!isOpen(cxp-1,cyp))cand.push(1);
-        if(j<NR-1&&!isOpen(cxp,cyp+1))cand.push(2);
-        if(j>0&&!isOpen(cxp,cyp-1))cand.push(3);
-        var o=cand[(r()*cand.length)|0];
-        if(o===0)opn(cxp+1,cyp);else if(o===1)opn(cxp-1,cyp);else if(o===2)opn(cxp,cyp+1);else opn(cxp,cyp-1);
-      }
-    }
-    var p=new Int16Array(NC*NR),comps=NC*NR;
+    var p=new Int16Array(NX*NY),comps=NX*NY;
     for(i=0;i<p.length;i++)p[i]=i;
     function find(a){while(p[a]!==a){p[a]=p[p[a]];a=p[a];}return a;}
-    for(j=0;j<NR;j++)for(i=0;i<NC;i++){
+    for(j=0;j<NY;j++)for(i=0;i<NX;i++){
       var cx2=x0+2*i+1,cy2=y0+2*j+1;
-      if(i<NC-1&&isOpen(cx2+1,cy2)){var A=find(j*NC+i),B=find(j*NC+i+1);if(A!==B){p[A]=B;comps--;}}
-      if(j<NR-1&&isOpen(cx2,cy2+1)){var A2=find(j*NC+i),B2=find((j+1)*NC+i);if(A2!==B2){p[A2]=B2;comps--;}}
+      if(i<NX-1&&t[K(cx2+1,cy2)]===0){var A=find(j*NX+i),B=find(j*NX+i+1);if(A!==B){p[A]=B;comps--;}}
+      if(j<NY-1&&t[K(cx2,cy2+1)]===0){var A2=find(j*NX+i),B2=find((j+1)*NX+i);if(A2!==B2){p[A2]=B2;comps--;}}
     }
-    var guard=400;
+    var guard=200;
     while(comps>1&&guard-->0){
-      for(j=0;j<NR;j++)for(i=0;i<NC;i++){
+      for(j=0;j<NY;j++)for(i=0;i<NX;i++){
         var cx3=x0+2*i+1,cy3=y0+2*j+1;
-        if(i<NC-1){var a1=find(j*NC+i),b1=find(j*NC+i+1);if(a1!==b1&&r()<0.5){opn(cx3+1,cy3);p[a1]=b1;comps--;}}
-        if(j<NR-1){var a2=find(j*NC+i),b2=find((j+1)*NC+i);if(a2!==b2&&r()<0.5){opn(cx3,cy3+1);p[a2]=b2;comps--;}}
+        if(i<NX-1){var a1=find(j*NX+i),b1=find(j*NX+i+1);if(a1!==b1&&r()<0.5){opn(cx3+1,cy3);p[a1]=b1;comps--;}}
+        if(j<NY-1){var a2=find(j*NX+i),b2=find((j+1)*NX+i);if(a2!==b2&&r()<0.5){opn(cx3,cy3+1);p[a2]=b2;comps--;}}
       }
     }
-    var vert=this.vert,n=vert?NC:NR,a0=vert?x0:y0;
-    this.n=n;this.a0=a0;this.sgn=(d===0||d===1)?-1:1;
-    this.lead=d===0?y0:(d===2?y1:(d===1?x0:x1));
-    var seam=this.lead,cntp;
-    do{
-      cntp=0;
-      for(i=0;i<n;i++)this.pf[i]=0;
-      for(i=0;i<n;i++)if(r()<0.5){this.pf[i]=1;cntp++;}
-    }while(cntp<2);
-    for(i=0;i<n;i++){
-      var v2=a0+2*i+1,sx=vert?v2:seam,sy=vert?seam:v2;
-      if(this.pf[i])opn(sx,sy);
-      this.sets[i]=1;
+  },
+  /* add K cell lines (2K tile lines) on side s (0 top,1 left,2 bottom,3 right) */
+  extend:function(s,K){
+    var r=this.rnd,t=this.tiles,it=this.items,i,j,a,c,k,m,x,y,horiz=(s===1||s===3);
+    var along=horiz?(this.x1-this.x0):(this.y1-this.y0),cross=horiz?(this.y1-this.y0):(this.x1-this.x0);
+    var NC=cross>>1;if(NC<1)return;
+    var add=2*K,trimmed=false;
+    if(along+1+add>64){var tr=along+1+add-64;if(tr&1)tr++;this.trim(s^2,tr);trimmed=true;along-=tr;}
+    var hadCells=along>=2,ox0=this.x0,ox1=this.x1,oy0=this.y0,oy1=this.y1;
+    // new rect + clear new area
+    var nx0=ox0,nx1=ox1,ny0=oy0,ny1=oy1;
+    if(s===0)ny0=oy0-add;else if(s===2)ny1=oy1+add;else if(s===1)nx0=ox0-add;else nx1=ox1+add;
+    for(y=ny0;y<=ny1;y++)for(x=nx0;x<=nx1;x++){
+      if(x>=ox0&&x<=ox1&&y>=oy0&&y<=oy1)continue;
+      k=(x&63)|((y&63)<<6);t[k]=1;it[k]=0;
     }
-    this.nextSet=2;
+    this.x0=nx0;this.x1=nx1;this.y0=ny0;this.y1=ny1;
+    // strip cell (a,c): a = distance from the old border (0 adjacent), c = across index
+    function cxy(a,c){
+      if(s===0)return [ox0+1+2*c,oy0-1-2*a];
+      if(s===2)return [ox0+1+2*c,oy1+1+2*a];
+      if(s===1)return [ox0-1-2*a,oy0+1+2*c];
+      return [ox1+1+2*a,oy0+1+2*c];
+    }
+    var cells=K*NC,deg=new Uint8Array(cells),px,py;
+    for(a=0;a<K;a++)for(c=0;c<NC;c++){var q=cxy(a,c);t[(q[0]&63)|((q[1]&63)<<6)]=0;it[(q[0]&63)|((q[1]&63)<<6)]=1;}
+    function lk(a1,c1,a2,c2){ // open the link tile between two strip cells (a2/c2 may be -1 in a = old border cell)
+      var p1=cxy(a1,c1),p2=cxy(a2,c2),lx=(p1[0]+p2[0])>>1,ly=(p1[1]+p2[1])>>1,z=(lx&63)|((ly&63)<<6);
+      t[z]=0;it[z]=1;
+    }
+    function isOpenLk(a1,c1,a2,c2){var p1=cxy(a1,c1),p2=cxy(a2,c2),lx=(p1[0]+p2[0])>>1,ly=(p1[1]+p2[1])>>1;return t[(lx&63)|((ly&63)<<6)]===0;}
+    // randomized Kruskal spanning tree over the strip + extra loops
+    var edges=[],ne=0;
+    for(a=0;a<K;a++)for(c=0;c<NC;c++){
+      if(c+1<NC){edges.push(a,c,a,c+1);}
+      if(a+1<K){edges.push(a,c,a+1,c);}
+    }
+    ne=edges.length>>2;
+    var ord=new Array(ne);for(i=0;i<ne;i++)ord[i]=i;
+    for(i=ne-1;i>0;i--){j=(r()*(i+1))|0;var tm=ord[i];ord[i]=ord[j];ord[j]=tm;}
+    var p=new Int16Array(cells);for(i=0;i<cells;i++)p[i]=i;
+    function find(z){while(p[z]!==z){p[z]=p[p[z]];z=p[z];}return z;}
+    var extra=[];
+    for(i=0;i<ne;i++){
+      var e0=ord[i]*4,a1=edges[e0],c1=edges[e0+1],a2=edges[e0+2],c2=edges[e0+3];
+      var A=find(a1*NC+c1),B=find(a2*NC+c2);
+      if(A!==B){p[A]=B;lk(a1,c1,a2,c2);}else extra.push(e0);
+    }
+    for(i=0;i<extra.length;i++)if(r()<0.16){var e1=extra[i];lk(edges[e1],edges[e1+1],edges[e1+2],edges[e1+3]);}
+    // seam to the old border cells (a=-1): at least 2 openings, otherwise ~half of them
+    if(hadCells){
+      var seam=new Uint8Array(NC),sc=0;
+      for(c=0;c<NC;c++)if(r()<0.5){seam[c]=1;sc++;}
+      while(sc<Math.min(2,NC)){c=(r()*NC)|0;if(!seam[c]){seam[c]=1;sc++;}}
+      for(c=0;c<NC;c++)if(seam[c])lk(-1,c,0,c);
+    }
+    // no dead ends: every strip cell gets >=2 open links
+    var dxl=[[0,-1],[1,0],[0,1],[-1,0]];
+    for(a=0;a<K;a++)for(c=0;c<NC;c++){
+      var d=0,cand=[];
+      // links: across (c-1,c+1), along (a-1,a+1) where a-1==-1 is the seam
+      if(c>0){if(isOpenLk(a,c,a,c-1))d++;else cand.push([a,c-1]);}
+      if(c<NC-1){if(isOpenLk(a,c,a,c+1))d++;else cand.push([a,c+1]);}
+      if(a<K-1){if(isOpenLk(a,c,a+1,c))d++;else cand.push([a+1,c]);}
+      if(a>0){if(isOpenLk(a,c,a-1,c))d++;else cand.push([a-1,c]);}
+      else if(hadCells){if(isOpenLk(a,c,-1,c))d++;else cand.push([-1,c]);}
+      while(d<2&&cand.length){var qi=(r()*cand.length)|0,cd=cand.splice(qi,1)[0];lk(a,c,cd[0],cd[1]);d++;}
+    }
+    // dots on every open tile of the new area (incl. the seam links); power pellets now and then
+    for(y=ny0;y<=ny1;y++)for(x=nx0;x<=nx1;x++){
+      if(x>=ox0&&x<=ox1&&y>=oy0&&y<=oy1&&!(hadCells&&((s===0&&y===oy0)||(s===2&&y===oy1)||(s===1&&x===ox0)||(s===3&&x===ox1))))continue;
+      k=(x&63)|((y&63)<<6);
+      if(t[k]===0&&!it[k])it[k]=1;
+    }
+    this.gens++;
+    this.powerAcc+=cells;
+    if(this.gens>=3&&this.powerAcc>=this.powerNext){
+      a=(r()*K)|0;c=(r()*NC)|0;var pc=cxy(a,c);it[(pc[0]&63)|((pc[1]&63)<<6)]=2;
+      this.powerAcc=0;this.powerNext=100+((r()*60)|0);
+    }
+    if(trimmed)this.repair();
   }
 };
 
@@ -213,7 +217,7 @@ var TURNLEN=15,WARNLEN=2,HOLEN=2,WALLH=12;
 var G={state:'title',score:0,hi:0,lives:3,time:0,diff:0,scare:0,chain:0,inv:0,camX:0,camY:0,chase:false,modeT:3,nextLife:5000,
   dyingT:0,overT:0,pausedFrom:'play',muted:false,pad:false,dist:0,scoreStr:'0',hiStr:'0',anim:0,musicT:0,musicI:0,wakaI:0,
   lvl:0,newHi:false,why:'',seed:1,frames:0,upd:0,rend:0,fpsAvg:16.7,attractT:0,dots:0,
-  dir:0,nextDir:1,phaseT:0,phaseLen:TURNLEN,ho:0,warn:false,warned:false,rampT:0,rampLen:5,w1d:0,w1t:WALLH,w0d:0,w0t:0,flash:0,switches:0};
+  dir:0,nextDir:1,phaseT:0,phaseLen:TURNLEN,ho:0,warn:false,warned:false,rampT:0,rampLen:5,w1d:0,w1t:WALLH,w0d:0,w0t:0,w0s:0,panFrom:0,flash:0,switches:0};
 var P={tx:9,ty:-3,dir:-1,off:0,x:0,y:0,want:-1,face:0};
 G.wantT=0;
 var E=[];
@@ -431,14 +435,16 @@ function viewTiles(){ // fills vtx0..vty1
   vtx0=Math.floor(G.camX/T);vty0=Math.floor(G.camY/T);vtx1=vtx0+COLS-1;vty1=vty0+VROWS-1;
 }
 var vtx0=0,vty0=0,vtx1=0,vty1=0;
-function ensureGen(){
-  var g=60,d=G.dir;
+function ensureGen(){ // keep the world >= LM tiles beyond the view on every side (extends lazily on any side)
+  var LM=8,g=40,did;
   viewTiles();
   while(g-->0){
-    if(d===0){if(M.y0>vty0-9)M.gen();else break;}
-    else if(d===2){if(M.y1<vty1+9)M.gen();else break;}
-    else if(d===1){if(M.x0>vtx0-9)M.gen();else break;}
-    else{if(M.x1<vtx1+9)M.gen();else break;}
+    did=false;
+    if(M.y0>vty0-LM){M.extend(0,3);did=true;}
+    if(M.y1<vty1+1+LM){M.extend(2,3);did=true;}
+    if(M.x0>vtx0-LM){M.extend(1,3);did=true;}
+    if(M.x1<vtx1+1+LM){M.extend(3,3);did=true;}
+    if(!did)break;
   }
 }
 function pickDir(cur){var r=(rnd()*3)|0;return r>=cur?r+1:r;}
@@ -525,7 +531,7 @@ function spawnEnemy(e){
     k=3+((rnd()*5)|0);
     a=d===0?vty0+k:(d===2?vty1-k:(d===1?vtx0+k:vtx1-k));
     if((a&1)===0)a+=(d===0||d===1)?1:-1;
-    if(vert){tx=M.x0+1+2*((rnd()*9)|0);ty=a;}else{ty=M.y0+1+2*((rnd()*16)|0);tx=a;}
+    if(vert){tx=oddIn(vtx0+1+((rnd()*(COLS-2))|0),M.x0+1,M.x1-1);ty=a;}else{ty=oddIn(vty0+1+((rnd()*(VROWS-2))|0),M.y0+1,M.y1-1);tx=a;}
     if(!M.open(tx,ty))continue;
     var dx=tx-P.tx,dy=ty-P.ty,dd=dx*dx+dy*dy;
     if(dd>bestD){bestD=dd;bx=tx;by=ty;}
@@ -560,7 +566,7 @@ function startGame(seed){
   G.score=0;G.scoreStr='0';G.lives=3;G.time=0;G.diff=0;G.scare=0;G.chain=0;G.inv=2.0;G.chase=false;G.modeT=3;G.nextLife=5000;
   G.newHi=false;G.hiStart=G.hiSaved;G.dots=0;G.musicT=0;G.musicI=0;G.why='';G.overT=0;G.dyingT=0;G.dist=0;
   G.dir=0;G.nextDir=pickDir(0);G.phaseT=0;G.phaseLen=TURNLEN;G.ho=0;G.warn=false;G.warned=false;G.rampT=0;G.rampLen=5;
-  G.w1d=0;G.w1t=WALLH;G.w0d=0;G.w0t=0;G.flash=0;G.switches=0;
+  G.w1d=0;G.w1t=WALLH;G.w0d=0;G.w0t=0;G.w0s=0;G.panFrom=0;G.flash=0;G.switches=0;
   P.tx=9;P.ty=-3;P.dir=-1;P.off=0;P.want=-1;P.face=0;G.wantT=0;place(P);
   G.camX=0;G.camY=P.y-0.68*VH;
   ensureGen();
@@ -597,36 +603,28 @@ function saveHi(){
 function popup(x,y,s){
   for(var i=0;i<POP.length;i++){var p=POP[i];if(p.t<=0){p.t=1.0;p.x=x;p.y=y;p.s=s;return;}}
 }
-/* change the scroll direction: re-base the maze on the aligned view window, move the wall, keep everyone valid */
+/* change the scroll direction: nothing in the world changes (ghost, enemies, dots, maze stay put); only the scroll axis and
+   the wall side change.  The camera then eases (see playStep) so the ghost has a safe margin from the new wall. */
+var SAFEM=56;
 function switchDir(b){
-  var a=G.dir;
-  var wx0=2*Math.round(G.camX/16),wy0=2*Math.round(G.camY/16);
-  var minX=(M.x0+1)&~1,maxX=(M.x1-18)&~1,minY=(M.y0+1)&~1,maxY=(M.y1-32)&~1;
-  if(maxX<minX)maxX=minX;if(maxY<minY)maxY=minY;
-  if(wx0<minX)wx0=minX;if(wx0>maxX)wx0=maxX;if(wy0<minY)wy0=minY;if(wy0>maxY)wy0=maxY;
-  M.switchTo(b,wx0,wy0);
-  G.camX=wx0*T;G.camY=wy0*T;
-  G.w0d=G.w1d;G.w0t=(G.w1t>0&&G.ho<=0)?G.w1t:G.w0t;
+  G.w0d=G.w1d;G.w0s=G.w1t;G.w0t=G.w1t;
   G.dir=b;G.w1d=b;G.w1t=0;
-  G.ho=HOLEN;G.rampT=0;G.rampLen=1.5;G.flash=0.45;G.switches++;
+  G.ho=HOLEN;G.rampT=0;G.rampLen=1.5;G.flash=0.35;G.switches++;
   G.nextDir=pickDir(b);G.warn=false;G.warned=false;
   if(G.inv<HOLEN+1.0)G.inv=HOLEN+1.0;
-  // enemies: anything now in a wall / outside the window goes back to the spawner
-  var i,e;
-  for(i=0;i<4;i++){
-    e=E[i];e.dist.fill(65535);e.bt=0;
-    if(e.state===1){
-      var bad=!M.open(e.tx,e.ty)||(e.dir>=0&&!M.open(e.tx+DX[e.dir],e.ty+DY[e.dir]));
-      if(bad){e.state=0;e.timer=1.0;}
-    }
-  }
-  // player
-  var pbad=!M.open(P.tx,P.ty)||(P.dir>=0&&!M.open(P.tx+DX[P.dir],P.ty+DY[P.dir]))||gapTo(b,WALLH,P.x,P.y,3)<32;
-  if(pbad){midTarget();toCell(P,snapX,snapY);P.want=-1;G.wantT=0;M.items[(P.tx&63)|((P.ty&63)<<6)]=0;}
-  for(i=0;i<POP.length;i++)POP[i].t=0;
+  G.panFrom=leadF();
   ensureGen();
-  for(i=0;i<4;i++){e=E[i];if(e.state===1)retarget(e);}
   Snd.glitch();
+}
+function crossFollow(dt){ // camera follows the ghost on the axis across the scroll (dead zone +-30px, speed-limited), so the ghost never leaves the view
+  var c,dz=30,k=Math.min(1,dt*6),mx=80*dt,s;
+  if(G.dir===0||G.dir===2){
+    c=P.x-(G.camX+W/2);s=c>dz?(c-dz)*k:(c<-dz?(c+dz)*k:0);
+    if(s>mx)s=mx;else if(s<-mx)s=-mx;G.camX+=s;
+  }else{
+    c=P.y-(G.camY+VH/2);s=c>dz?(c-dz)*k:(c<-dz?(c+dz)*k:0);
+    if(s>mx)s=mx;else if(s<-mx)s=-mx;G.camY+=s;
+  }
 }
 function playStep(dt){
   G.time+=dt;
@@ -640,20 +638,26 @@ function playStep(dt){
   if(G.phaseT>=G.phaseLen){G.phaseT-=G.phaseLen;switchDir(G.nextDir);}
   if(G.flash>0)G.flash-=dt;
   // wall bands animate during the handover
-  if(G.ho>0){G.w1t=WALLH*(1-G.ho/HOLEN);G.w0t=WALLH*(G.ho/HOLEN);}
+  if(G.ho>0){G.w1t=WALLH*(1-G.ho/HOLEN);G.w0t=G.w0s*(G.ho/HOLEN);}
   else{G.w1t=WALLH;G.w0t=0;}
   // scroll
   var cf0=leadF(),cf=cf0;
   if(G.ho<=0)G.rampT+=dt;
   var ramp=G.rampT/G.rampLen;if(ramp>1)ramp=1;
   cf+=(1.0+2.3*diff)*ramp*T*dt;
+  if(G.ho>0){ // handover: ease the camera so the ghost sits >= SAFEM px from the trailing edge (the new wall side); the ghost never moves
+    var u=1-G.ho/HOLEN,ez=u*(2-u);
+    var cT=Math.min(G.panFrom,fwdOf(P.x,P.y,G.dir)+viewL(G.dir)-SAFEM);
+    cf=G.panFrom+(cT-G.panFrom)*ez;
+  }
   if(G.wantT>0){G.wantT-=dt;if(G.wantT<=0)P.want=-1;}
   advance(P,(5.7+0.7*diff)*T*dt,true);
   if(P.dir>=0)P.face=P.dir;
   var tgt=fwdOf(P.x,P.y,G.dir)+0.42*viewL(G.dir);
-  if(tgt>cf)cf+=(tgt-cf)*Math.min(1,dt*8);
+  if(tgt>cf){var pl=(tgt-cf)*Math.min(1,dt*8),pm=100*dt;cf+=pl>pm?pm:pl;}   // pull the camera after a ghost that runs ahead (speed-limited so a switch never makes it jump)
   setLeadF(cf);
-  G.dist+=cf-cf0;
+  crossFollow(dt);
+  if(cf>cf0)G.dist+=cf-cf0;
   ensureGen();
   if(G.inv>0)G.inv-=dt;
   if(G.scare>0){G.scare-=dt;if(G.scare<0)G.scare=0;}
@@ -669,7 +673,7 @@ function playStep(dt){
       }
     }else if(G.inv<=0&&d2<26){kill('pac');break;}
   }
-  if(G.state==='play'&&gapTo(G.w1d,G.w1t,P.x,P.y,3)<0)kill('wall');
+  if(G.state==='play'&&G.w1t>=1.5&&gapTo(G.w1d,G.w1t,P.x,P.y,3)<0)kill('wall');
   for(i=0;i<POP.length;i++)if(POP[i].t>0){POP[i].t-=dt;POP[i].y-=8*dt;}
   Snd.music(dt);
 }
@@ -858,7 +862,7 @@ function render(){
   if(G.state!=='title'){
     drawEnemies();drawPlayer();drawPopups();drawWall();
     drawHUD();
-    if(G.flash>0){ // glitch burst while the maze is re-based
+    if(G.flash>0){ // short glitch burst at a direction switch
       var fr=Math.random,k;
       for(k=0;k<14;k++){cx.fillStyle=GCOL[(fr()*6)|0];cx.fillRect(0,HUD+((fr()*VH)|0),W,1+((fr()*2)|0));}
       for(k=0;k<6;k++){var yy=HUD+((fr()*VH)|0),hh=2+((fr()*6)|0);cx.drawImage(cv,0,yy,W,hh,((fr()*21)|0)-10,yy,W,hh);}
