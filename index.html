@@ -63,83 +63,163 @@ function lsSet(k,v){try{window.localStorage.setItem(k,v);}catch(e){}}
 function mkRng(seed){var s=seed>>>0;return function(){s=(s+0x6D2B79F5)>>>0;var t=s;t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296;};}
 var rnd=mkRng((Date.now()^0x9e3779b9)>>>0);
 
-/* ===================== maze (infinite, Eller-style row generation) ===================== */
+/* ===================== maze (infinite, Eller-style strip generation in any of 4 directions) ===================== */
+/* World = global tile lattice: cells sit on (odd,odd) tiles, walls/passages on the rest. Tiles live in a 64x64 toroidal
+   buffer; the "rect" [x0..x1]x[y0..y1] is the currently valid region (never larger than 64 in either axis).
+   Vertical phases (up/down) are 19 tiles wide and generate rows ahead; horizontal phases (left/right) are 33 tiles tall
+   and generate columns ahead. A direction switch re-bases the rect on the current (aligned) view window, repairs it
+   (closes borders, removes dead ends, merges components) and continues Eller's algorithm from that seam. */
 var M={
-  tiles:new Uint8Array(RB*COLS), items:new Uint8Array(RB*COLS),
-  genTop:0,k:0,nextSet:1,rnd:null,powerCd:3,tun:0,
-  sets:new Int32Array(9),fwd:new Uint8Array(9),pf:new Uint8Array(9),hl:new Uint8Array(9),tmp:new Uint8Array(9),opt:new Uint8Array(3),
+  tiles:new Uint8Array(4096), items:new Uint8Array(4096),
+  x0:0,x1:18,y0:0,y1:0,vert:true,d:0,lead:0,sgn:-1,a0:0,n:9,
+  nextSet:1,rnd:null,powerCd:3,cnt:0,
+  sets:new Int32Array(18),fwd:new Uint8Array(18),pf:new Uint8Array(18),hl:new Uint8Array(18),tmp:new Uint8Array(18),opt:new Uint8Array(3),
   reset:function(seed){
-    this.tiles.fill(1);this.items.fill(0);this.genTop=0;this.k=0;this.nextSet=1;this.powerCd=3;
-    this.pf.fill(0);this.fwd.fill(0);this.hl.fill(0);this.sets.fill(0);this.rnd=mkRng(seed);
+    this.tiles.fill(1);this.items.fill(0);this.x0=0;this.x1=18;this.y0=0;this.y1=0;this.vert=true;this.d=0;this.lead=0;this.sgn=-1;
+    this.a0=0;this.n=9;this.nextSet=1;this.powerCd=3;this.cnt=0;this.pf.fill(0);this.fwd.fill(0);this.hl.fill(0);this.sets.fill(0);
+    this.rnd=mkRng(seed);
   },
-  open:function(x,ry){
-    if(x<0)x+=COLS;else if(x>=COLS)x-=COLS;
-    if(ry<this.genTop||ry>0||ry>this.genTop+RM)return false;
-    return this.tiles[(ry&RM)*COLS+x]===0;
+  wx:function(x){if(this.vert){if(x<this.x0)return x+19;if(x>this.x1)return x-19;}return x;},
+  wy:function(y){if(!this.vert){if(y<this.y0)return y+33;if(y>this.y1)return y-33;}return y;},
+  inRect:function(x,y){return x>=this.x0&&x<=this.x1&&y>=this.y0&&y<=this.y1;},
+  open:function(x,y){
+    if(this.vert){if(x<this.x0)x+=19;else if(x>this.x1)x-=19;}
+    else{if(y<this.y0)y+=33;else if(y>this.y1)y-=33;}
+    if(x<this.x0||x>this.x1||y<this.y0||y>this.y1)return false;
+    return this.tiles[(x&63)|((y&63)<<6)]===0;
   },
-  get:function(x,ry){ // 0 open, 1 wall (also for ungenerated)
-    return this.open(x,ry)?0:1;
+  item:function(x,y){
+    if(x<this.x0||x>this.x1||y<this.y0||y>this.y1)return 0;
+    return this.items[(x&63)|((y&63)<<6)];
   },
-  item:function(x,ry){
-    if(ry<this.genTop||ry>0||ry>this.genTop+RM)return 0;
-    return this.items[(ry&RM)*COLS+x];
+  put:function(u,v,val){
+    var x=this.vert?v:u,y=this.vert?u:v,i=(x&63)|((y&63)<<6);
+    this.tiles[i]=val;if(val)this.items[i]=0;
   },
   gen:function(){
-    var k=this.k,ryC=-2*k,ryR=-2*k-1,t=this.tiles,it=this.items,r=this.rnd;
-    var cb=(ryC&RM)*COLS,rb=(ryR&RM)*COLS,i,c,j,q,n;
-    for(i=0;i<COLS;i++){t[cb+i]=1;t[rb+i]=1;it[cb+i]=0;it[rb+i]=0;}
-    var sets=this.sets,fwd=this.fwd,pf=this.pf,hl=this.hl,tmp=this.tmp;
-    for(c=0;c<9;c++){
-      if(k>0&&pf[c]){t[cb+2*c+1]=0;}else sets[c]=this.nextSet++;
-    }
-    for(c=0;c<8;c++){
+    var cl=this.lead,sg=this.sgn,rl=cl+sg,a0=this.a0,n=this.n,r=this.rnd,c,j,q,m,v,i;
+    var sets=this.sets,fwd=this.fwd,pf=this.pf,hl=this.hl,tmp=this.tmp,opt=this.opt;
+    for(v=a0;v<=a0+2*n;v++){this.put(cl,v,1);this.put(rl,v,1);}
+    for(c=0;c<n;c++){if(pf[c])this.put(cl,a0+2*c+1,0);else sets[c]=this.nextSet++;}
+    for(c=0;c<n-1;c++){
       hl[c]=0;var a=sets[c],b=sets[c+1];
-      if(a!==b){ if(r()<0.6){hl[c]=1;for(j=0;j<9;j++)if(sets[j]===b)sets[j]=a;} }
+      if(a!==b){if(r()<0.6){hl[c]=1;for(j=0;j<n;j++)if(sets[j]===b)sets[j]=a;}}
       else if(r()<0.2)hl[c]=1;
     }
-    for(c=0;c<9;c++)fwd[c]=0;
-    for(c=0;c<9;c++){
+    for(c=0;c<n;c++)fwd[c]=0;
+    for(c=0;c<n;c++){
       var s=sets[c],first=true;
       for(j=0;j<c;j++)if(sets[j]===s){first=false;break;}
       if(!first)continue;
-      n=0;for(j=c;j<9;j++)if(sets[j]===s)tmp[n++]=j;
-      fwd[tmp[(r()*n)|0]]=1;
-      for(q=0;q<n;q++)if(r()<0.35)fwd[tmp[q]]=1;
+      m=0;for(j=c;j<n;j++)if(sets[j]===s)tmp[m++]=j;
+      fwd[tmp[(r()*m)|0]]=1;
+      for(q=0;q<m;q++)if(r()<0.35)fwd[tmp[q]]=1;
     }
-    var tun=(k>=1&&r()<0.14)?1:0;this.tun=tun;
-    var opt=this.opt;
-    for(c=0;c<9;c++){
-      var cnt=((k>0&&pf[c])?1:0)+((c>0&&hl[c-1])?1:0)+((c<8&&hl[c])?1:0)+fwd[c]+((c===0&&tun)?1:0)+((c===8&&tun)?1:0);
+    var tun=(this.cnt>=1&&r()<0.14)?1:0;
+    for(c=0;c<n;c++){
+      var cnt=(pf[c]?1:0)+((c>0&&hl[c-1])?1:0)+((c<n-1&&hl[c])?1:0)+fwd[c]+((c===0&&tun)?1:0)+((c===n-1&&tun)?1:0);
       if(cnt<=1){
-        n=0;
-        if(c>0&&!hl[c-1])opt[n++]=0;
-        if(c<8&&!hl[c])opt[n++]=1;
-        if(!fwd[c])opt[n++]=2;
-        if(n>0){var o=opt[(r()*n)|0];if(o===0)hl[c-1]=1;else if(o===1)hl[c]=1;else fwd[c]=1;}
+        m=0;
+        if(c>0&&!hl[c-1])opt[m++]=0;
+        if(c<n-1&&!hl[c])opt[m++]=1;
+        if(!fwd[c])opt[m++]=2;
+        if(m>0){var o=opt[(r()*m)|0];if(o===0)hl[c-1]=1;else if(o===1)hl[c]=1;else fwd[c]=1;}
       }
     }
-    for(c=0;c<9;c++){
-      t[rb+2*c+1]=0;
-      if(c<8&&hl[c])t[rb+2*c+2]=0;
+    for(c=0;c<n;c++){
+      this.put(rl,a0+2*c+1,0);
+      if(c<n-1&&hl[c])this.put(rl,a0+2*c+2,0);
     }
-    if(tun){t[rb]=0;t[rb+COLS-1]=0;}
-    for(i=0;i<COLS;i++){if(t[cb+i]===0)it[cb+i]=1;if(t[rb+i]===0)it[rb+i]=1;}
-    if(k>=3){ if(--this.powerCd<=0){ c=(r()*9)|0; it[rb+2*c+1]=2; this.powerCd=8+((r()*7)|0); } }
-    for(c=0;c<9;c++)pf[c]=fwd[c];   // sets[] stays: next row inherits labels for fwd cells
-    this.genTop=ryR;this.k=k+1;
+    if(tun){this.put(rl,a0,0);this.put(rl,a0+2*n,0);}
+    for(v=a0;v<=a0+2*n;v++){
+      for(i=0;i<2;i++){
+        var u=i?rl:cl,x=this.vert?v:u,y=this.vert?u:v,k=(x&63)|((y&63)<<6);
+        if(this.tiles[k]===0)this.items[k]=1;
+      }
+    }
+    if(this.cnt>=3){if(--this.powerCd<=0){c=(r()*n)|0;var pu=rl,pv=a0+2*c+1,px=this.vert?pv:pu,py=this.vert?pu:pv;this.items[(px&63)|((py&63)<<6)]=2;this.powerCd=8+((r()*7)|0);}}
+    for(c=0;c<n;c++)pf[c]=fwd[c];
+    this.lead=cl+2*sg;this.cnt++;
+    var d=this.d;
+    if(d===0){this.y0=rl;this.y1=Math.min(this.y1,rl+63);}
+    else if(d===2){this.y1=rl;this.y0=Math.max(this.y0,rl-63);}
+    else if(d===1){this.x0=rl;this.x1=Math.min(this.x1,rl+63);}
+    else{this.x1=rl;this.x0=Math.max(this.x0,rl-63);}
+  },
+  /* re-base on the aligned 19x33 window (wx0,wy0 even) and continue generating in direction d */
+  switchTo:function(d,wx0,wy0){
+    var x0=wx0,x1=wx0+18,y0=wy0,y1=wy0+32,x,y,i,j,k,r=this.rnd,t=this.tiles,it=this.items,NC=9,NR=16;
+    for(y=y0;y<=y1;y++)for(x=x0;x<=x1;x++){
+      if(!(x>=this.x0&&x<=this.x1&&y>=this.y0&&y<=this.y1)){k=(x&63)|((y&63)<<6);t[k]=((x&1)&&(y&1))?0:1;it[k]=0;}
+    }
+    this.x0=x0;this.x1=x1;this.y0=y0;this.y1=y1;this.d=d;this.vert=(d===0||d===2);
+    for(x=x0;x<=x1;x++){k=(x&63)|((y0&63)<<6);t[k]=1;it[k]=0;k=(x&63)|((y1&63)<<6);t[k]=1;it[k]=0;}
+    for(y=y0;y<=y1;y++){k=(x0&63)|((y&63)<<6);t[k]=1;it[k]=0;k=(x1&63)|((y&63)<<6);t[k]=1;it[k]=0;}
+    function kx(px,py){return (px&63)|((py&63)<<6);}
+    function isOpen(px,py){return t[kx(px,py)]===0;}
+    function opn(px,py){var q=kx(px,py);t[q]=0;if(!it[q])it[q]=1;}
+    // right link of cell (i,j) at (x0+2i+2,y0+2j+1); down link at (x0+2i+1,y0+2j+2)
+    var cnt;
+    for(j=0;j<NR;j++)for(i=0;i<NC;i++){
+      var cxp=x0+2*i+1,cyp=y0+2*j+1;
+      cnt=(i<NC-1&&isOpen(cxp+1,cyp)?1:0)+(i>0&&isOpen(cxp-1,cyp)?1:0)+(j<NR-1&&isOpen(cxp,cyp+1)?1:0)+(j>0&&isOpen(cxp,cyp-1)?1:0);
+      if(cnt<=1){
+        var cand=[];
+        if(i<NC-1&&!isOpen(cxp+1,cyp))cand.push(0);
+        if(i>0&&!isOpen(cxp-1,cyp))cand.push(1);
+        if(j<NR-1&&!isOpen(cxp,cyp+1))cand.push(2);
+        if(j>0&&!isOpen(cxp,cyp-1))cand.push(3);
+        var o=cand[(r()*cand.length)|0];
+        if(o===0)opn(cxp+1,cyp);else if(o===1)opn(cxp-1,cyp);else if(o===2)opn(cxp,cyp+1);else opn(cxp,cyp-1);
+      }
+    }
+    var p=new Int16Array(NC*NR),comps=NC*NR;
+    for(i=0;i<p.length;i++)p[i]=i;
+    function find(a){while(p[a]!==a){p[a]=p[p[a]];a=p[a];}return a;}
+    for(j=0;j<NR;j++)for(i=0;i<NC;i++){
+      var cx2=x0+2*i+1,cy2=y0+2*j+1;
+      if(i<NC-1&&isOpen(cx2+1,cy2)){var A=find(j*NC+i),B=find(j*NC+i+1);if(A!==B){p[A]=B;comps--;}}
+      if(j<NR-1&&isOpen(cx2,cy2+1)){var A2=find(j*NC+i),B2=find((j+1)*NC+i);if(A2!==B2){p[A2]=B2;comps--;}}
+    }
+    var guard=400;
+    while(comps>1&&guard-->0){
+      for(j=0;j<NR;j++)for(i=0;i<NC;i++){
+        var cx3=x0+2*i+1,cy3=y0+2*j+1;
+        if(i<NC-1){var a1=find(j*NC+i),b1=find(j*NC+i+1);if(a1!==b1&&r()<0.5){opn(cx3+1,cy3);p[a1]=b1;comps--;}}
+        if(j<NR-1){var a2=find(j*NC+i),b2=find((j+1)*NC+i);if(a2!==b2&&r()<0.5){opn(cx3,cy3+1);p[a2]=b2;comps--;}}
+      }
+    }
+    var vert=this.vert,n=vert?NC:NR,a0=vert?x0:y0;
+    this.n=n;this.a0=a0;this.sgn=(d===0||d===1)?-1:1;
+    this.lead=d===0?y0:(d===2?y1:(d===1?x0:x1));
+    var seam=this.lead,cntp;
+    do{
+      cntp=0;
+      for(i=0;i<n;i++)this.pf[i]=0;
+      for(i=0;i<n;i++)if(r()<0.5){this.pf[i]=1;cntp++;}
+    }while(cntp<2);
+    for(i=0;i<n;i++){
+      var v2=a0+2*i+1,sx=vert?v2:seam,sy=vert?seam:v2;
+      if(this.pf[i])opn(sx,sy);
+      this.sets[i]=1;
+    }
+    this.nextSet=2;
   }
 };
 
 /* ===================== state ===================== */
-var G={state:'title',score:0,hi:0,lives:3,time:0,diff:0,scare:0,chain:0,inv:0,camY:0,chase:false,modeT:3,nextLife:5000,
-  dyingT:0,overT:0,pausedFrom:'play',muted:false,pad:false,minTy:0,scoreStr:'0',hiStr:'0',anim:0,musicT:0,musicI:0,wakaI:0,
-  lvl:0,newHi:false,why:'',seed:1,frames:0,upd:0,rend:0,fpsAvg:16.7,attractT:0,wallY:0,dots:0};
+var DN=['UP','LEFT','DOWN','RIGHT'];
+var TURNLEN=30,WARNLEN=2,HOLEN=2,WALLH=12;
+var G={state:'title',score:0,hi:0,lives:3,time:0,diff:0,scare:0,chain:0,inv:0,camX:0,camY:0,chase:false,modeT:3,nextLife:5000,
+  dyingT:0,overT:0,pausedFrom:'play',muted:false,pad:false,dist:0,scoreStr:'0',hiStr:'0',anim:0,musicT:0,musicI:0,wakaI:0,
+  lvl:0,newHi:false,why:'',seed:1,frames:0,upd:0,rend:0,fpsAvg:16.7,attractT:0,dots:0,
+  dir:0,nextDir:1,phaseT:0,phaseLen:TURNLEN,ho:0,warn:false,warned:false,rampT:0,rampLen:5,w1d:0,w1t:WALLH,w0d:0,w0t:0,flash:0,switches:0};
 var P={tx:9,ty:-3,dir:-1,off:0,x:0,y:0,want:-1,face:0};
 G.wantT=0;
 var E=[];
-for(var ei=0;ei<4;ei++)E.push({kind:ei,tx:0,ty:0,dir:-1,off:0,x:0,y:0,state:0,timer:1,grace:0,bt:0,dist:new Uint16Array(RB*COLS),face:2,lost:0});
+for(var ei=0;ei<4;ei++)E.push({kind:ei,tx:0,ty:0,dir:-1,off:0,x:0,y:0,state:0,timer:1,grace:0,bt:0,dist:new Uint16Array(4096),face:2,lost:0});
 var POP=[];for(var pi=0;pi<4;pi++)POP.push({t:0,x:0,y:0,s:''});
-var qx=new Uint8Array(RB*COLS),qy=new Int16Array(RB*COLS);
+var qx=new Int32Array(4096),qy=new Int32Array(4096);
 var snapX=0,snapY=0;
 
 /* ===================== audio ===================== */
@@ -162,6 +242,8 @@ var Snd={ctx:null,master:null,muted:false,count:0,
       o.connect(g);g.connect(this.master);o.start(t);o.stop(t+d+0.03);this.count++;
     }catch(e){}
   },
+  warn:function(){for(var i=0;i<3;i++)this.tone(880,0.07,'square',0.22,null,i*0.12);},
+  glitch:function(){this.tone(1100,0.5,'square',0.2,70);this.tone(140,0.6,'triangle',0.4,40);},
   dot:function(){G.wakaI^=1;this.tone(G.wakaI?330:440,0.07,'triangle',0.5,G.wakaI?440:330);},
   power:function(){for(var i=0;i<5;i++)this.tone(300*Math.pow(1.26,i),0.09,'square',0.18,null,i*0.05);},
   eat:function(){this.tone(220,0.22,'square',0.25,1100);},
@@ -261,7 +343,6 @@ for(var gv=0;gv<3;gv++){for(var gd=0;gd<4;gd++){GH[gv][gd]=[mkGhost(gv,gd,0),mkG
 var SCAN=(function(){var m=mk(W,H);m[1].fillStyle='rgba(0,0,0,0.16)';for(var y=1;y<H;y+=2)m[1].fillRect(0,y,W,1);return m[0];})();
 
 /* ===================== movement ===================== */
-function wrapX(x){return x<0?x+COLS:(x>=COLS?x-COLS:x);}
 function place(e){
   var d=e.dir;
   if(d<0){e.x=e.tx*T+4;e.y=e.ty*T+4;}
@@ -270,7 +351,7 @@ function place(e){
 function flip(e){
   if(e.dir<0)return;
   if(e.off>0){
-    e.tx=wrapX(e.tx+DX[e.dir]);e.ty+=DY[e.dir];e.off=T-e.off;e.dir^=2;
+    e.tx=M.wx(e.tx+DX[e.dir]);e.ty=M.wy(e.ty+DY[e.dir]);e.off=T-e.off;e.dir^=2;
   }else{
     var d2=e.dir^2;
     if(M.open(e.tx+DX[d2],e.ty+DY[d2]))e.dir=d2;else e.dir=-1;
@@ -289,7 +370,7 @@ function advance(e,dist,pl){
     var st=T-e.off;if(dist<st)st=dist;
     e.off+=st;dist-=st;
     if(e.off>=T-0.0001){
-      e.tx=wrapX(e.tx+DX[e.dir]);e.ty+=DY[e.dir];e.off=0;
+      e.tx=M.wx(e.tx+DX[e.dir]);e.ty=M.wy(e.ty+DY[e.dir]);e.off=0;
       if(pl)onPlayerTile();
     }
   }
@@ -297,7 +378,7 @@ function advance(e,dist,pl){
 }
 function decidePlayer(e){
   var w=e.want;
-  if(w>=0&&M.open(e.tx+DX[w],e.ty+DY[w])){e.dir=w;if(w===e.face&&false)e.want=-1;}
+  if(w>=0&&M.open(e.tx+DX[w],e.ty+DY[w]))e.dir=w;
   else if(e.dir>=0&&!M.open(e.tx+DX[e.dir],e.ty+DY[e.dir]))e.dir=-1;
 }
 function decideEnemy(e){
@@ -310,9 +391,9 @@ function decideEnemy(e){
     var bd=70000;
     for(d=0;d<4;d++){
       if(d===rev)continue;
-      var nx=wrapX(tx+DX[d]),ny=ty+DY[d];
+      var nx=M.wx(tx+DX[d]),ny=M.wy(ty+DY[d]);
       if(!M.open(nx,ny))continue;
-      var nd=e.dist[(ny&RM)*COLS+nx];
+      var nd=e.dist[(nx&63)|((ny&63)<<6)];
       if(nd<bd){bd=nd;best=d;}
     }
   }
@@ -320,8 +401,7 @@ function decideEnemy(e){
   e.dir=best;if(best>=0)e.face=best;
 }
 function onPlayerTile(){
-  var idx=((P.ty&RM)*COLS)+P.tx,v=M.items[idx];
-  if(P.ty<G.minTy)G.minTy=P.ty;
+  var idx=(P.tx&63)|((P.ty&63)<<6),v=M.items[idx];
   if(v===1){M.items[idx]=0;addScore(10);Snd.dot();G.dots++;}
   else if(v===2){M.items[idx]=0;addScore(50);startPower();}
 }
@@ -335,40 +415,89 @@ function startPower(){
   for(var i=0;i<4;i++){var e=E[i];if(e.state===1)flip(e);}
 }
 
+/* ===================== camera / direction helpers ===================== */
+function viewL(d){return (d&1)?W:VH;}
+function leadF(){var d=G.dir;return d===0?-G.camY:(d===2?G.camY+VH:(d===1?-G.camX:G.camX+W));}
+function setLeadF(cf){var d=G.dir;if(d===0)G.camY=-cf;else if(d===2)G.camY=cf-VH;else if(d===1)G.camX=-cf;else G.camX=cf-W;}
+function fwdOf(x,y,d){return x*DX[d]+y*DY[d];}
+/* distance (px) from entity extreme to the inner edge of a wall band of scroll direction wd and thickness wt; <0 = inside the wall */
+function gapTo(wd,wt,ex,ey,m){
+  if(wd===0)return (G.camY+VH-wt)-(ey+m);
+  if(wd===2)return (ey-m)-(G.camY+wt);
+  if(wd===1)return (G.camX+W-wt)-(ex+m);
+  return (ex-m)-(G.camX+wt);
+}
+function viewTiles(){ // fills vtx0..vty1
+  vtx0=Math.floor(G.camX/T);vty0=Math.floor(G.camY/T);vtx1=vtx0+COLS-1;vty1=vty0+VROWS-1;
+}
+var vtx0=0,vty0=0,vtx1=0,vty1=0;
+function ensureGen(){
+  var g=60,d=G.dir;
+  viewTiles();
+  while(g-->0){
+    if(d===0){if(M.y0>vty0-9)M.gen();else break;}
+    else if(d===2){if(M.y1<vty1+9)M.gen();else break;}
+    else if(d===1){if(M.x0>vtx0-9)M.gen();else break;}
+    else{if(M.x1<vtx1+9)M.gen();else break;}
+  }
+}
+function pickDir(cur){var r=(rnd()*3)|0;return r>=cur?r+1:r;}
+function oddIn(v,lo,hi){
+  if(v<lo)v=lo;if(v>hi)v=hi;
+  if((v&1)===0){if(v+1<=hi)v++;else v--;}
+  return v;
+}
+/* put entity on the nearest cell tile (clamped inside the valid rect) */
+function toCell(e,tx,ty){
+  e.tx=oddIn(tx,M.x0+1,M.x1-1);e.ty=oddIn(ty,M.y0+1,M.y1-1);e.dir=-1;e.off=0;place(e);
+}
+function midTarget(){ // tile in the middle of the view along the scroll axis, same across position as the player
+  viewTiles();
+  var tx=P.tx,ty=P.ty;
+  if(tx<vtx0)tx=vtx0;if(tx>vtx1)tx=vtx1;if(ty<vty0)ty=vty0;if(ty>vty1)ty=vty1;
+  if(G.dir===0||G.dir===2)ty=(vty0+vty1)>>1;else tx=(vtx0+vtx1)>>1;
+  snapX=tx;snapY=ty;
+}
+
 /* ===================== enemies ===================== */
 function bfs(dist,sx,sy){
   dist.fill(65535);
-  var top=M.genTop,bot=Math.min(0,top+RM),tiles=M.tiles,h=0,t=0;
-  qx[0]=sx;qy[0]=sy;t=1;dist[(sy&RM)*COLS+sx]=0;
+  var x0=M.x0,x1=M.x1,y0=M.y0,y1=M.y1,tiles=M.tiles,h=0,t=1;
+  qx[0]=sx;qy[0]=sy;dist[(sx&63)|((sy&63)<<6)]=0;
   while(h<t){
     var x=qx[h],y=qy[h];h++;
-    var d=dist[(y&RM)*COLS+x]+1;
+    var d=dist[(x&63)|((y&63)<<6)]+1;
     for(var k=0;k<4;k++){
-      var nx=x+DX[k],ny=y+DY[k];
-      if(nx<0)nx=COLS-1;else if(nx>=COLS)nx=0;
-      if(ny<top||ny>bot)continue;
-      var ni=(ny&RM)*COLS+nx;
+      var nx=M.wx(x+DX[k]),ny=M.wy(y+DY[k]);
+      if(nx<x0||nx>x1||ny<y0||ny>y1)continue;
+      var ni=(nx&63)|((ny&63)<<6);
       if(tiles[ni]!==0||dist[ni]!==65535)continue;
       dist[ni]=d;qx[t]=nx;qy[t]=ny;t++;
     }
   }
 }
 function snap(gx,gy){
-  var lo=M.genTop+1,hi=Math.min(0,M.genTop+RM)-1;
-  if(gx<0)gx=0;else if(gx>COLS-1)gx=COLS-1;
-  if(gy<lo)gy=lo;else if(gy>hi)gy=hi;
+  var lx=M.x0+1,hx=M.x1-1,ly=M.y0+1,hy=M.y1-1;
+  if(gx<lx)gx=lx;else if(gx>hx)gx=hx;
+  if(gy<ly)gy=ly;else if(gy>hy)gy=hy;
   if(M.open(gx,gy)){snapX=gx;snapY=gy;return;}
   var best=1e9;snapX=P.tx;snapY=P.ty;
   for(var dy=-4;dy<=4;dy++)for(var dx=-4;dx<=4;dx++){
-    var x=gx+dx,y=gy+dy;if(x<0||x>=COLS||y<lo||y>hi)continue;
+    var x=gx+dx,y=gy+dy;if(x<M.x0||x>M.x1||y<M.y0||y>M.y1)continue;
     var d=dx*dx+dy*dy;if(d<best&&M.open(x,y)){best=d;snapX=x;snapY=y;}
   }
 }
 function cornerTarget(kind){
-  var cr=Math.floor(G.camY/T),lo=cr+3,hi=cr+VROWS-6;
-  var right=(kind===0||kind===2);
-  snapX=right?COLS-2:1;snapY=(kind<2)?lo:hi;
-  snap(snapX,snapY);
+  viewTiles();
+  var d=G.dir,lead=kind<2,gx,gy;
+  if(d===0||d===2){
+    gx=(kind&1)?vtx0+2:vtx1-2;
+    if(d===0)gy=lead?vty0+3:vty1-6;else gy=lead?vty1-3:vty0+6;
+  }else{
+    gy=(kind&1)?vty0+3:vty1-3;
+    if(d===1)gx=lead?vtx0+3:vtx1-6;else gx=lead?vtx1-3:vtx0+6;
+  }
+  snap(gx,gy);
 }
 function retarget(e){
   var gx=P.tx,gy=P.ty,k=e.kind,f=P.face;
@@ -386,30 +515,35 @@ function retarget(e){
     }
   }
   bfs(e.dist,snapX,snapY);
-  if(e.dist[(e.ty&RM)*COLS+e.tx]===65535){if(++e.lost>4){e.state=0;e.timer=0.4;e.lost=0;}}else e.lost=0;
+  if(e.dist[(e.tx&63)|((e.ty&63)<<6)]===65535){if(++e.lost>4){e.state=0;e.timer=0.4;e.lost=0;}}else e.lost=0;
 }
 var KSPD=[1.0,0.97,0.95,0.92];
 function spawnEnemy(e){
-  var cr=Math.floor(G.camY/T),bestD=-1,bx=9,by=cr+5,i;
-  for(i=0;i<6;i++){
-    var ry=cr+3+((rnd()*5)|0);if((ry&1)===0)ry--;
-    if(ry<=M.genTop+1)continue;
-    var c=1+2*((rnd()*9)|0),dx=c-P.tx,dy=ry-P.ty,d=dx*dx+dy*dy;
-    if(d>bestD){bestD=d;bx=c;by=ry;}
-    if(d>144)break;
+  viewTiles();
+  var d=G.dir,vert=(d===0||d===2),bestD=-1,bx=0,by=0,i,k,a,c,tx,ty;
+  for(i=0;i<8;i++){
+    k=3+((rnd()*5)|0);
+    a=d===0?vty0+k:(d===2?vty1-k:(d===1?vtx0+k:vtx1-k));
+    if((a&1)===0)a+=(d===0||d===1)?1:-1;
+    if(vert){tx=M.x0+1+2*((rnd()*9)|0);ty=a;}else{ty=M.y0+1+2*((rnd()*16)|0);tx=a;}
+    if(!M.open(tx,ty))continue;
+    var dx=tx-P.tx,dy=ty-P.ty,dd=dx*dx+dy*dy;
+    if(dd>bestD){bestD=dd;bx=tx;by=ty;}
+    if(dd>144)break;
   }
-  e.tx=bx;e.ty=by;e.dir=-1;e.off=0;e.state=1;e.grace=1.3;e.bt=0;e.face=2;
+  if(bestD<0){e.state=0;e.timer=0.5;return;}
+  e.tx=bx;e.ty=by;e.dir=-1;e.off=0;e.state=1;e.grace=1.3;e.bt=0;e.face=2;e.lost=0;
   place(e);retarget(e);
 }
 function updEnemy(e,dt){
   if(e.state===0){e.timer-=dt;if(e.timer<=0)spawnEnemy(e);return;}
   if(e.grace>0)e.grace-=dt;
   var scared=G.scare>0;
-  if(!scared){e.bt-=dt;if(e.bt<=0){e.bt=0.2+0.05*e.kind;retarget(e);}}
+  if(!scared){e.bt-=dt;if(e.bt<=0){e.bt=0.2+0.05*e.kind;retarget(e);if(e.state!==1)return;}}
   var sp=(4.0+1.7*G.diff)*KSPD[e.kind]*(scared?0.5:1);
   if(e.grace>0)sp*=0.6;
   advance(e,sp*T*dt,false);
-  if(e.y-4>G.wallY||e.ty>M.genTop+RM-2){e.state=0;e.timer=1.5;}
+  if(!M.inRect(e.tx,e.ty)||(G.w1t>0&&gapTo(G.w1d,G.w1t,e.x,e.y,0)<-4)){e.state=0;e.timer=1.5;}
 }
 function sendAway(e,delay){e.state=0;e.timer=delay;}
 
@@ -424,11 +558,13 @@ function startGame(seed){
   G.seed=seed;rnd=mkRng(seed^0xabcdef);
   M.reset(seed);
   G.score=0;G.scoreStr='0';G.lives=3;G.time=0;G.diff=0;G.scare=0;G.chain=0;G.inv=2.0;G.chase=false;G.modeT=3;G.nextLife=5000;
-  G.minTy=-3;G.newHi=false;G.hiStart=G.hiSaved;G.dots=0;G.musicT=0;G.musicI=0;G.why='';G.overT=0;G.dyingT=0;
+  G.newHi=false;G.hiStart=G.hiSaved;G.dots=0;G.musicT=0;G.musicI=0;G.why='';G.overT=0;G.dyingT=0;G.dist=0;
+  G.dir=0;G.nextDir=pickDir(0);G.phaseT=0;G.phaseLen=TURNLEN;G.ho=0;G.warn=false;G.warned=false;G.rampT=0;G.rampLen=5;
+  G.w1d=0;G.w1t=WALLH;G.w0d=0;G.w0t=0;G.flash=0;G.switches=0;
   P.tx=9;P.ty=-3;P.dir=-1;P.off=0;P.want=-1;P.face=0;G.wantT=0;place(P);
-  G.camY=P.y-0.68*VH;
-  while(M.genTop>Math.floor(G.camY/T)-8)M.gen();
-  M.items[((P.ty&RM)*COLS)+P.tx]=0;
+  G.camX=0;G.camY=P.y-0.68*VH;
+  ensureGen();
+  M.items[(P.tx&63)|((P.ty&63)<<6)]=0;
   resetEnemies();
   for(var i=0;i<POP.length;i++)POP[i].t=0;
   G.state='play';
@@ -436,10 +572,9 @@ function startGame(seed){
   updButtons();
 }
 function respawn(){
-  var ry=Math.floor((G.camY+VH*0.5)/T);if((ry&1)===0)ry--;
-  var c=P.tx;c=1+2*Math.round((c-1)/2);if(c<1)c=1;if(c>17)c=17;
-  P.tx=c;P.ty=ry;P.dir=-1;P.off=0;P.want=-1;G.wantT=0;place(P);
-  M.items[((ry&RM)*COLS)+c]=0;
+  midTarget();
+  toCell(P,snapX,snapY);P.want=-1;G.wantT=0;
+  var ti=(P.tx&63)|((P.ty&63)<<6);M.items[ti]=0;
   G.inv=2.8;
   for(var i=0;i<4;i++){var e=E[i];if(e.state===1){var dx=e.tx-P.tx,dy=e.ty-P.ty;if(dx*dx+dy*dy<64)sendAway(e,2.0);}}
   G.state='play';
@@ -453,7 +588,7 @@ function gameOver(){
   G.newHi=G.score>0&&G.score>G.hiStart;
   saveHi();Snd.over();updButtons();
 }
-G.hiSaved=0;
+G.hiSaved=0;G.hiStart=0;
 function saveHi(){
   if(G.score>G.hiSaved){G.hiSaved=G.score;lsSet('ghost256.hi',''+G.hiSaved);}
   if(G.hiSaved>G.hi){G.hi=G.hiSaved;}
@@ -462,20 +597,64 @@ function saveHi(){
 function popup(x,y,s){
   for(var i=0;i<POP.length;i++){var p=POP[i];if(p.t<=0){p.t=1.0;p.x=x;p.y=y;p.s=s;return;}}
 }
+/* change the scroll direction: re-base the maze on the aligned view window, move the wall, keep everyone valid */
+function switchDir(b){
+  var a=G.dir;
+  var wx0=2*Math.round(G.camX/16),wy0=2*Math.round(G.camY/16);
+  var minX=(M.x0+1)&~1,maxX=(M.x1-18)&~1,minY=(M.y0+1)&~1,maxY=(M.y1-32)&~1;
+  if(maxX<minX)maxX=minX;if(maxY<minY)maxY=minY;
+  if(wx0<minX)wx0=minX;if(wx0>maxX)wx0=maxX;if(wy0<minY)wy0=minY;if(wy0>maxY)wy0=maxY;
+  M.switchTo(b,wx0,wy0);
+  G.camX=wx0*T;G.camY=wy0*T;
+  G.w0d=G.w1d;G.w0t=(G.w1t>0&&G.ho<=0)?G.w1t:G.w0t;
+  G.dir=b;G.w1d=b;G.w1t=0;
+  G.ho=HOLEN;G.rampT=0;G.rampLen=1.5;G.flash=0.45;G.switches++;
+  G.nextDir=pickDir(b);G.warn=false;G.warned=false;
+  if(G.inv<HOLEN+1.0)G.inv=HOLEN+1.0;
+  // enemies: anything now in a wall / outside the window goes back to the spawner
+  var i,e;
+  for(i=0;i<4;i++){
+    e=E[i];e.dist.fill(65535);e.bt=0;
+    if(e.state===1){
+      var bad=!M.open(e.tx,e.ty)||(e.dir>=0&&!M.open(e.tx+DX[e.dir],e.ty+DY[e.dir]));
+      if(bad){e.state=0;e.timer=1.0;}
+    }
+  }
+  // player
+  var pbad=!M.open(P.tx,P.ty)||(P.dir>=0&&!M.open(P.tx+DX[P.dir],P.ty+DY[P.dir]))||gapTo(b,WALLH,P.x,P.y,3)<32;
+  if(pbad){midTarget();toCell(P,snapX,snapY);P.want=-1;G.wantT=0;M.items[(P.tx&63)|((P.ty&63)<<6)]=0;}
+  for(i=0;i<POP.length;i++)POP[i].t=0;
+  ensureGen();
+  for(i=0;i<4;i++){e=E[i];if(e.state===1)retarget(e);}
+  Snd.glitch();
+}
 function playStep(dt){
   G.time+=dt;
   var diff=G.time/360;if(diff>1)diff=1;G.diff=diff;
   G.lvl=((G.time/40)|0)%6;
   G.modeT-=dt;if(G.modeT<=0){G.chase=!G.chase;G.modeT=G.chase?11:(3.8-2.2*diff);}
-  var ramp=G.time/5;if(ramp>1)ramp=1;
-  G.camY-=(1.0+2.3*diff)*ramp*T*dt;
+  // direction schedule: warn 2s ahead, switch every phaseLen seconds of play
+  if(G.ho>0){G.ho-=dt;if(G.ho<0)G.ho=0;}
+  G.phaseT+=dt;
+  if(!G.warned&&G.phaseT>=G.phaseLen-WARNLEN){G.warned=true;G.warn=true;Snd.warn();}
+  if(G.phaseT>=G.phaseLen){G.phaseT-=G.phaseLen;switchDir(G.nextDir);}
+  if(G.flash>0)G.flash-=dt;
+  // wall bands animate during the handover
+  if(G.ho>0){G.w1t=WALLH*(1-G.ho/HOLEN);G.w0t=WALLH*(G.ho/HOLEN);}
+  else{G.w1t=WALLH;G.w0t=0;}
+  // scroll
+  var cf0=leadF(),cf=cf0;
+  if(G.ho<=0)G.rampT+=dt;
+  var ramp=G.rampT/G.rampLen;if(ramp>1)ramp=1;
+  cf+=(1.0+2.3*diff)*ramp*T*dt;
   if(G.wantT>0){G.wantT-=dt;if(G.wantT<=0)P.want=-1;}
   advance(P,(5.7+0.7*diff)*T*dt,true);
   if(P.dir>=0)P.face=P.dir;
-  var tgt=P.y-0.42*VH;if(tgt<G.camY)G.camY+=(tgt-G.camY)*Math.min(1,dt*8);
-  var crow=Math.floor(G.camY/T);
-  while(M.genTop>crow-8)M.gen();
-  G.wallY=G.camY+VH-WALLH;
+  var tgt=fwdOf(P.x,P.y,G.dir)+0.42*viewL(G.dir);
+  if(tgt>cf)cf+=(tgt-cf)*Math.min(1,dt*8);
+  setLeadF(cf);
+  G.dist+=cf-cf0;
+  ensureGen();
   if(G.inv>0)G.inv-=dt;
   if(G.scare>0){G.scare-=dt;if(G.scare<0)G.scare=0;}
   var i,e;
@@ -490,16 +669,15 @@ function playStep(dt){
       }
     }else if(G.inv<=0&&d2<26){kill('pac');break;}
   }
-  if(G.state==='play'&&P.y+3>G.wallY)kill('wall');
+  if(G.state==='play'&&G.ho<=0&&gapTo(G.w1d,G.w1t,P.x,P.y,3)<0)kill('wall');
   for(i=0;i<POP.length;i++)if(POP[i].t>0){POP[i].t-=dt;POP[i].y-=8*dt;}
   Snd.music(dt);
 }
 function attract(dt){
   G.attractT+=dt;
-  if(M.genTop===0){M.reset(777);G.camY=-VH+40;}
+  if(!G.attractInit){G.attractInit=true;M.reset(777);G.dir=0;G.camX=0;G.camY=-VH+40;}
   G.camY-=14*dt;
-  var crow=Math.floor(G.camY/T);
-  while(M.genTop>crow-8)M.gen();
+  ensureGen();
 }
 function update(dt){
   G.upd++;
@@ -512,20 +690,20 @@ function update(dt){
 }
 
 /* ===================== rendering ===================== */
-var cr=0;
+var cxr=0,cyr=0;
 function drawMaze(){
   var pal=PAL[G.state==='play'||G.state==='pause'||G.state==='dying'||G.state==='over'?G.lvl:0];
   var edge=pal[0],fill=pal[1];
   if(G.scare>0){edge=(G.scare<1.6&&(((G.anim*8)|0)&1))?'#ffffff':'#a040ff';}
-  var r0=Math.floor(cr/T),yo=HUD-cr,ry,x;
+  var tx0=Math.floor(cxr/T),ty0=Math.floor(cyr/T),ty,tx;
   cx.fillStyle='#000';cx.fillRect(0,HUD,W,VH);
   var m=M;
-  for(ry=r0;ry<=r0+VROWS;ry++){
-    var py=yo+ry*T;
-    for(x=0;x<COLS;x++){
-      var px=x*T;
-      if(m.open(x,ry)){
-        var it=m.item(x,ry);
+  for(ty=ty0;ty<=ty0+VROWS;ty++){
+    var py=HUD+ty*T-cyr;
+    for(tx=tx0;tx<=tx0+COLS;tx++){
+      var px=tx*T-cxr;
+      if(m.open(tx,ty)){
+        var it=m.item(tx,ty);
         if(it===1){cx.fillStyle='#ffcfb0';cx.fillRect(px+3,py+3,2,2);}
         else if(it===2){
           if(((G.anim*6)|0)&1){cx.fillStyle='#ffcfb0';cx.fillRect(px+1,py,6,8);cx.fillRect(px,py+1,8,6);}
@@ -534,118 +712,136 @@ function drawMaze(){
       }
       cx.fillStyle=fill;cx.fillRect(px,py,T,T);
       cx.fillStyle=edge;
-      var oU=m.open(x,ry-1),oD=m.open(x,ry+1),oL=m.open(x-1,ry),oR=m.open(x+1,ry);
+      var oU=m.open(tx,ty-1),oD=m.open(tx,ty+1),oL=m.open(tx-1,ty),oR=m.open(tx+1,ty);
       if(oU)cx.fillRect(px,py,T,1);
       if(oD)cx.fillRect(px,py+T-1,T,1);
       if(oL)cx.fillRect(px,py,1,T);
       if(oR)cx.fillRect(px+T-1,py,1,T);
-      if(!oU&&!oL&&m.open(x-1,ry-1))cx.fillRect(px,py,1,1);
-      if(!oU&&!oR&&m.open(x+1,ry-1))cx.fillRect(px+T-1,py,1,1);
-      if(!oD&&!oL&&m.open(x-1,ry+1))cx.fillRect(px,py+T-1,1,1);
-      if(!oD&&!oR&&m.open(x+1,ry+1))cx.fillRect(px+T-1,py+T-1,1,1);
+      if(!oU&&!oL&&m.open(tx-1,ty-1))cx.fillRect(px,py,1,1);
+      if(!oU&&!oR&&m.open(tx+1,ty-1))cx.fillRect(px+T-1,py,1,1);
+      if(!oD&&!oL&&m.open(tx-1,ty+1))cx.fillRect(px,py+T-1,1,1);
+      if(!oD&&!oR&&m.open(tx+1,ty+1))cx.fillRect(px+T-1,py+T-1,1,1);
     }
   }
 }
 var fseq=[0,1,2,1];
 function drawEnemies(){
-  var yo=HUD-cr;
   for(var i=0;i<4;i++){
     var e=E[i];if(e.state!==1)continue;
     if(e.grace>0&&(((e.grace*14)|0)&1))continue;
     var mode=0;
     if(G.scare>0){mode=(G.scare<1.6&&(((G.anim*8)|0)&1))?2:1;}
     var f=fseq[((G.anim*12)|0)&3];
-    cx.drawImage(PAC[mode][i][e.face][f],0,0,10,10,Math.round(e.x-5),Math.round(e.y-5)+yo,10,10);
-    // wrap ghost image across tunnel edges
+    cx.drawImage(PAC[mode][i][e.face][f],0,0,10,10,Math.round(e.x-5)-cxr,Math.round(e.y-5)-cyr+HUD,10,10);
   }
 }
 function drawPlayer(){
-  var yo=HUD-cr,v=0,f=((G.anim*8)|0)&1,d=P.face;
+  var v=0,f=((G.anim*8)|0)&1,d=P.face,sx=Math.round(P.x)-cxr,sy=Math.round(P.y)-cyr+HUD;
   if(G.state==='dying'){
     var k=1-G.dyingT/1.1,s=1-k;if(s<0.05)return;
     var spr=GH[(((G.anim*14)|0)&1)?2:0][d][0],sz=Math.max(1,Math.round(10*s));
-    cx.drawImage(spr,0,0,10,10,Math.round(P.x-sz/2),Math.round(P.y-sz/2)+yo,sz,sz);return;
+    cx.drawImage(spr,0,0,10,10,Math.round(sx-sz/2),Math.round(sy-sz/2),sz,sz);return;
   }
   if(G.inv>0&&(((G.inv*12)|0)&1))return;
   if(G.scare>0)v=(((G.anim*10)|0)&1)?1:0;
-  cx.drawImage(GH[v][d][f],0,0,10,10,Math.round(P.x-5),Math.round(P.y-5)+yo,10,10);
+  cx.drawImage(GH[v][d][f],0,0,10,10,sx-5,sy-5,10,10);
+}
+function band(d,u,v,l,dep,col){ // v measured from the outer screen edge inwards
+  cx.fillStyle=col;
+  if(d===0)cx.fillRect(u,HUD+VH-v-dep,l,dep);
+  else if(d===2)cx.fillRect(u,HUD+v,l,dep);
+  else if(d===1)cx.fillRect(W-v-dep,HUD+u,dep,l);
+  else cx.fillRect(v,HUD+u,dep,l);
+}
+var GCOL=['#ff00ff','#00ffff','#ffffff','#2f3cff','#ff2020','#00ff66'];
+function drawWallBand(d,t,near){
+  if(t<0.6)return;
+  var tt=Math.round(t),len=(d&1)?VH:W,i,v,u,rn=Math.random;
+  band(d,0,0,len,tt,'#000');
+  for(u=0;u<len;u+=4){var h=(rn()*5)|0;band(d,u,tt,4,h+1,GCOL[(rn()*6)|0]);}
+  for(v=0;v<tt;v+=2){
+    var n=near?7:4;
+    for(i=0;i<n;i++)band(d,(rn()*len)|0,v,2+((rn()*(near?40:24))|0),1+((rn()*2)|0),GCOL[(rn()*6)|0]);
+    if(rn()<0.3)band(d,(rn()*len)|0,v,10+((rn()*30)|0),2,'#000');
+  }
+  // displaced slice of maze next to the wall (glitch shimmer)
+  var off=((rn()*9)|0)-4,hh=2+((rn()*3)|0);
+  if(d===0){var ys=HUD+VH-tt-10;cx.drawImage(cv,0,ys,W,hh,off,ys,W,hh);}
+  else if(d===2){var ys2=HUD+tt+4;cx.drawImage(cv,0,ys2,W,hh,off,ys2,W,hh);}
+  else if(d===1){var xs=W-tt-10;cx.drawImage(cv,xs,HUD,hh,VH,xs,HUD+off,hh,VH);}
+  else{var xs2=tt+4;cx.drawImage(cv,xs2,HUD,hh,VH,xs2,HUD+off,hh,VH);}
 }
 function drawWall(){
-  var wy=Math.round(G.wallY-cr)+HUD,i,x;
-  if(wy>=H)return;
-  var near=(P.y-G.wallY)>-48&&G.state==='play';
-  cx.fillStyle='#000';cx.fillRect(0,wy,W,H-wy);
-  var cols=['#ff00ff','#00ffff','#ffffff','#2f3cff','#ff2020','#00ff66'];
-  var rnds=Math.random;
-  // jagged edge
-  for(x=0;x<W;x+=4){
-    var h=(rnds()*5)|0;
-    cx.fillStyle=cols[(rnds()*6)|0];cx.fillRect(x,wy-h,4,h+1);
-  }
-  for(var y=wy+1;y<H;y+=2){
-    var n=near?7:4;
-    for(i=0;i<n;i++){
-      cx.fillStyle=cols[(rnds()*6)|0];
-      cx.fillRect((rnds()*W)|0,y,2+((rnds()*(near?40:24))|0),1+((rnds()*2)|0));
-    }
-    if(rnds()<0.3){cx.fillStyle='#000';cx.fillRect((rnds()*W)|0,y,10+((rnds()*30)|0),2);}
-  }
-  // displaced slice of maze just above (glitch shimmer)
-  if(wy>HUD+16){
-    var sy=wy-10,hh=2+((rnds()*3)|0),off=((rnds()*9)|0)-4;
-    cx.drawImage(cv,0,sy,W,hh,off,sy,W,hh);
-  }
+  var near=G.state==='play'&&gapTo(G.w1d,G.w1t,P.x,P.y,3)<48;
+  drawWallBand(G.w0d,G.w0t,false);
+  drawWallBand(G.w1d,G.w1t,near);
+}
+function arrow(x,y,d,col){ // 11x11 pixel arrow
+  cx.fillStyle=col;
+  var r;
+  for(r=0;r<6;r++)seg(x,y,d,5-r,r,1+2*r,1);
+  seg(x,y,d,4,6,3,5);
+}
+function seg(x,y,d,u,v,w,h){ // rectangle given in an "up-pointing" frame, rotated to direction d
+  if(d===0)cx.fillRect(x+u,y+v,w,h);
+  else if(d===2)cx.fillRect(x+u,y+11-v-h,w,h);
+  else if(d===1)cx.fillRect(x+v,y+u,h,w);
+  else cx.fillRect(x+11-v-h,y+u,h,w);
+}
+function drawBanner(){
+  if(!(G.warn||G.ho>0))return;
+  var nd=G.warn?G.nextDir:G.dir,blink=((G.anim*6)|0)&1,y0=HUD+((VH/2)|0)-18,col=blink?'#ffe600':'#ffffff';
+  cx.fillStyle='rgba(0,0,0,0.78)';cx.fillRect(8,y0,W-16,38);
+  cx.fillStyle=col;cx.fillRect(8,y0,W-16,1);cx.fillRect(8,y0+37,W-16,1);
+  txtC('SCROLL '+DN[nd],y0+5,col,2);
+  var sh=((G.anim*8)|0)%3,i;
+  for(i=0;i<3;i++)arrow(((W-47)/2|0)+i*18,y0+22,nd,i===sh?'#ffffff':(blink?'#ffe600':'#a08800'));
 }
 function drawHUD(){
   cx.fillStyle='#000';cx.fillRect(0,0,W,HUD);
   cx.fillStyle='#202060';cx.fillRect(0,HUD-1,W,1);
   txt('SCORE',2,0,'#8888cc');txt(G.scoreStr,2,6,'#ffffff');
   var hs='HI',hx=W-2-txtW(G.hiStr,1);
-  txt(hs,W-2-txtW(hs,1)-(txtW(G.hiStr,1)-txtW(hs,1))*0,0,'#8888cc');
+  txt(hs,W-2-txtW(hs,1),0,'#8888cc');
   txt(G.hiStr,hx,6,G.score>=G.hi&&G.score>0?'#ffe600':'#ffffff');
   var n=G.lives>0?G.lives:0,lx=((W-n*9)/2)|0;
   for(var i=0;i<n;i++)cx.drawImage(GH[0][3][0],0,0,10,10,lx+i*9,1,10,10);
+  arrow(100,0,G.warn?G.nextDir:G.dir,G.warn?(((G.anim*8)|0)&1?'#ffe600':'#664400'):'#4a5aff');
   if(G.scare>0){cx.fillStyle='#a040ff';cx.fillRect(0,HUD-2,Math.round(W*G.scare/(7.5-3.5*G.diff)),1);}
 }
 function drawPopups(){
-  var yo=HUD-cr;
-  for(var i=0;i<POP.length;i++){var p=POP[i];if(p.t>0){var w=txtW(p.s,1);txt(p.s,Math.round(p.x-w/2),Math.round(p.y)+yo-3,'#00ffff');}}
+  for(var i=0;i<POP.length;i++){var p=POP[i];if(p.t>0){var w=txtW(p.s,1);txt(p.s,Math.round(p.x-w/2)-cxr,Math.round(p.y)-cyr+HUD-3,'#00ffff');}}
 }
 function dim(a){cx.fillStyle='rgba(0,0,0,'+a+')';cx.fillRect(0,0,W,H);}
 function panel(y,h,a){cx.fillStyle='rgba(0,0,0,'+a+')';cx.fillRect(4,y,W-8,h);}
 function drawTitle(){
   var t=G.anim;
   dim(0.6);
-  // logo with glitch
   var j=(((t*10)|0)%17===0)?((Math.random()*5)|0)-2:0;
   var gl=(((t*7)|0)%11===0);
   txtC('GHOST',18+(gl?1:0),'#00ffff',5);
-  cx.save();txt('GHOST',((W-txtW('GHOST',5))/2|0)+2+j,20,'#ff0000',5);cx.restore();
+  txt('GHOST',((W-txtW('GHOST',5))/2|0)+2+j,20,'#ff0000',5);
   txtC('GHOST',19,'#ffe600',5);
   var tx=((W-txtW('256',8))/2|0);
   txt('256',tx-1+j,50,'#ff0000',8);txt('256',tx+2,52,'#00ffff',8);txt('256',tx,51,'#ffffff',8);
-  // chase strip
   panel(97,22,0.65);
   var ph=((t/6)|0)&1,L=W+90,pos=(t*38)%L;
   var gx,i;
   if(!ph){gx=pos-20;cx.drawImage(GH[0][3][((t*8)|0)&1],0,0,10,10,Math.round(gx),102,10,10);
     for(i=0;i<4;i++)cx.drawImage(PAC[0][i][3][fseq[((t*12)|0)&3]],0,0,10,10,Math.round(gx-14-i*13),102,10,10);}
   else{var gp=L-pos-70;cx.drawImage(GH[((t*10)|0)&1?1:0][1][((t*8)|0)&1],0,0,10,10,Math.round(gp),102,10,10);
-    for(i=0;i<4;i++)cx.drawImage(PAC[((t*6)|0)&1?1:1][i][1][fseq[((t*12)|0)&3]],0,0,10,10,Math.round(gp-14-i*13+0),102,10,10);
-    // frightened ones flee left of ghost: draw mirrored positions
-  }
-  // legend
-  panel(122,56,0.7);
+    for(i=0;i<4;i++)cx.drawImage(PAC[1][i][1][fseq[((t*12)|0)&3]],0,0,10,10,Math.round(gp-14-i*13),102,10,10);}
+  panel(122,54,0.7);
   var lg=['RED: CHASES YOU','PINK: AMBUSHES AHEAD','CYAN: FLANKS VIA RED','ORANGE: SHY WHEN CLOSE'];
   for(i=0;i<4;i++){
-    cx.drawImage(PAC[0][i][3][fseq[((t*8+i)|0)&3]],0,0,10,10,12,124+i*13,10,10);
-    txt(lg[i],28,127+i*13,COLORS[i]);
+    cx.drawImage(PAC[0][i][3][fseq[((t*8+i)|0)&3]],0,0,10,10,12,123+i*13,10,10);
+    txt(lg[i],28,126+i*13,COLORS[i]);
   }
-  panel(182,62,0.7);
-  var help=['EAT DOTS. DODGE THE PAC-MEN!','POWER PELLET: EAT THEM BACK!','GLITCH WALL RISES FROM BELOW.','TOUCH IT OR GET CAUGHT = LOSE A LIFE','3 LIVES. EXTRA LIFE PER 5000 PTS.','SWIPE / ARROWS / WASD / D-PAD','P OR ESC: PAUSE   M: MUTE'];
-  for(i=0;i<help.length;i++)txtC(help[i],186+i*8,i<5?'#ffffff':'#ffe600',1);
-  if(((t*2)|0)&1)txtC('TAP OR PRESS SPACE TO START',250,'#ffe600',1);
-  txtC('HI '+G.hi,262,'#8888cc',1);
+  panel(178,78,0.7);
+  var help=['EAT DOTS. DODGE THE PAC-MEN!','POWER PELLET: EAT THEM BACK!','GLITCH WALL PUSHES FROM BEHIND.','TOUCH IT OR GET CAUGHT = LOSE A LIFE','EVERY 30 SEC THE SCROLL TURNS:','UP, DOWN, LEFT OR RIGHT. THE WALL','MOVES TO THE SIDE THAT PUSHES YOU!','3 LIVES. EXTRA LIFE PER 5000 PTS.','SWIPE / ARROWS / WASD / D-PAD','P OR ESC: PAUSE   M: MUTE'];
+  for(i=0;i<help.length;i++)txtC(help[i],181+i*7.5|0,i<4||i===7?'#ffffff':(i<7?'#00ffff':'#ffe600'),1);
+  if(((t*2)|0)&1)txtC('TAP OR PRESS SPACE TO START',259,'#ffe600',1);
+  txtC('HI '+G.hi,267,'#8888cc',1);
 }
 function drawOver(){
   dim(0.72);
@@ -653,7 +849,7 @@ function drawOver(){
   txtC(G.why==='wall'?'SWALLOWED BY THE GLITCH':'CAUGHT BY A PAC-MAN',100,'#8888cc',1);
   txtC('SCORE',122,'#8888cc',1);txtC(''+G.score,130,'#ffffff',3);
   txtC('BEST',156,'#8888cc',1);txtC(''+G.hi,164,'#ffe600',2);
-  txtC('DISTANCE '+(Math.max(0,((-G.minTy-3)/2)|0)),188,'#00ffff',1);
+  txtC('DISTANCE '+(Math.max(0,(G.dist/16)|0)),188,'#00ffff',1);
   if(G.newHi&&(((G.anim*4)|0)&1))txtC('NEW HIGH SCORE!',206,'#ffe600',1);
   if(G.overT>0.8&&(((G.anim*2)|0)&1))txtC('TAP OR PRESS SPACE TO RETRY',236,'#ffffff',1);
 }
@@ -665,12 +861,18 @@ function drawPause(){
 }
 function render(){
   var t0=performance.now();
-  cr=Math.round(G.camY);
+  cxr=Math.round(G.camX);cyr=Math.round(G.camY);
   cx.imageSmoothingEnabled=false;
   drawMaze();
   if(G.state!=='title'){
     drawEnemies();drawPlayer();drawPopups();drawWall();
     drawHUD();
+    if(G.flash>0){ // glitch burst while the maze is re-based
+      var fr=Math.random,k;
+      for(k=0;k<14;k++){cx.fillStyle=GCOL[(fr()*6)|0];cx.fillRect(0,HUD+((fr()*VH)|0),W,1+((fr()*2)|0));}
+      for(k=0;k<6;k++){var yy=HUD+((fr()*VH)|0),hh=2+((fr()*6)|0);cx.drawImage(cv,0,yy,W,hh,((fr()*21)|0)-10,yy,W,hh);}
+    }
+    drawBanner();
     if(G.state==='pause')drawPause();
     else if(G.state==='over')drawOver();
   }else{
@@ -789,19 +991,24 @@ function frame(ts){
   var hi=parseInt(lsGet('ghost256.hi'),10);if(hi>0){G.hi=hi;G.hiSaved=hi;}G.hiStr=''+G.hi;
   G.muted=lsGet('ghost256.mute')==='1';Snd.muted=G.muted;
   G.pad=lsGet('ghost256.pad')==='1';
-  M.reset(777);G.camY=-VH+40;
-  while(M.genTop>Math.floor(G.camY/T)-8)M.gen();
+  M.reset(777);G.dir=0;G.camX=0;G.camY=-VH+40;G.attractInit=true;
+  ensureGen();
   place(P);updButtons();fit();
   window.requestAnimationFrame(frame);
 })();
 
 /* debug / test hook (harmless in production) */
-window.__ghost={G:G,P:P,E:E,M:M,Snd:Snd,COLS:COLS,T:T,VROWS:VROWS,
+window.__ghost={G:G,P:P,E:E,M:M,Snd:Snd,COLS:COLS,T:T,VROWS:VROWS,DX:DX,DY:DY,HOLEN:HOLEN,WALLH:WALLH,
   step:function(n){for(var i=0;i<n;i++)update(STEP);},
   render:render,startGame:startGame,setWant:setWant,togglePause:togglePause,toggleMute:toggleMute,
   teleport:function(tx,ty){P.tx=tx;P.ty=ty;P.dir=-1;P.off=0;place(P);onPlayerTile();},
   findPower:function(){
-    var top=M.genTop;for(var ry=Math.floor(G.camY/T)+VROWS;ry>=top;ry--)for(var x=0;x<COLS;x++)if(M.item(x,ry)===2)return [x,ry];return null;},
+    viewTiles();for(var y=vty1;y>=vty0;y--)for(var x=vtx0;x<=vtx1;x++)if(M.item(x,y)===2)return [x,y];return null;},
+  view:function(){viewTiles();return {x0:vtx0,y0:vty0,x1:vtx1,y1:vty1};},
+  forceDir:function(d){if(G.state!=='play')return false;G.phaseT=0;switchDir(d);return true;},
+  gapAtTile:function(tx,ty){return gapTo(G.w1d,Math.max(G.w1t,0.01),tx*T+4,ty*T+4,3);},
+  wallGap:function(){return gapTo(G.w1d,G.w1t,P.x,P.y,3);},
+  fwd:fwdOf,viewL:viewL,
   kill:kill,gameOver:gameOver,mkRng:mkRng,sprites:{PAC:PAC,GH:GH}
 };
 })();
