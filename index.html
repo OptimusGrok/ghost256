@@ -220,7 +220,7 @@ var PAC=[[],[],[]];
 var MOUTH=[0,0.55,0.98];
 function mkPac(col,dir,f,mode){
   var m=mk(10,10),c=m[0],x=m[1],ang=[-Math.PI/2,Math.PI,Math.PI/2,0][dir];
-  var body=mode===0?col:(mode===1?'#2a3cff':'#f4f4ff');
+  var body=mode===0?col:(mode===1?'#3b66ff':'#f4f4ff');
   x.fillStyle=body;
   for(var py=0;py<10;py++)for(var px=0;px<10;px++){
     var dx=px+0.5-5,dy=py+0.5-5,r2=dx*dx+dy*dy;if(r2>24.6)continue;
@@ -232,11 +232,8 @@ function mkPac(col,dir,f,mode){
     var px2=[6,4,4,5][dir],py2=[4,3,5,3][dir];
     if(dir===0){px2=6;py2=4;} if(dir===2){px2=6;py2=5;}
     x.fillRect(px2,py2,1,1);
-  }else{
-    x.fillStyle=mode===1?'#ffd0b0':'#ff2020';
-    x.fillRect(3,3,1,2);x.fillRect(6,3,1,2);
-    for(var zx=2;zx<8;zx++)x.fillRect(zx,(zx&1)?7:6,1,1);
   }
+  // frightened (mode 1/2): plain blue / white Pac-Man body with chomping mouth, deliberately no face or skirt
   return c;
 }
 for(var md=0;md<3;md++){
