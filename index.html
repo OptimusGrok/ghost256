@@ -209,7 +209,7 @@ var M={
 
 /* ===================== state ===================== */
 var DN=['UP','LEFT','DOWN','RIGHT'];
-var TURNLEN=30,WARNLEN=2,HOLEN=2,WALLH=12;
+var TURNLEN=15,WARNLEN=2,HOLEN=2,WALLH=12;
 var G={state:'title',score:0,hi:0,lives:3,time:0,diff:0,scare:0,chain:0,inv:0,camX:0,camY:0,chase:false,modeT:3,nextLife:5000,
   dyingT:0,overT:0,pausedFrom:'play',muted:false,pad:false,dist:0,scoreStr:'0',hiStr:'0',anim:0,musicT:0,musicI:0,wakaI:0,
   lvl:0,newHi:false,why:'',seed:1,frames:0,upd:0,rend:0,fpsAvg:16.7,attractT:0,dots:0,
@@ -633,7 +633,7 @@ function playStep(dt){
   var diff=G.time/360;if(diff>1)diff=1;G.diff=diff;
   G.lvl=((G.time/40)|0)%6;
   G.modeT-=dt;if(G.modeT<=0){G.chase=!G.chase;G.modeT=G.chase?11:(3.8-2.2*diff);}
-  // direction schedule: warn 2s ahead, switch every phaseLen seconds of play
+  // direction schedule: sound cue 2s ahead (no on-screen text), switch every phaseLen seconds of play
   if(G.ho>0){G.ho-=dt;if(G.ho<0)G.ho=0;}
   G.phaseT+=dt;
   if(!G.warned&&G.phaseT>=G.phaseLen-WARNLEN){G.warned=true;G.warn=true;Snd.warn();}
@@ -669,7 +669,7 @@ function playStep(dt){
       }
     }else if(G.inv<=0&&d2<26){kill('pac');break;}
   }
-  if(G.state==='play'&&G.ho<=0&&gapTo(G.w1d,G.w1t,P.x,P.y,3)<0)kill('wall');
+  if(G.state==='play'&&gapTo(G.w1d,G.w1t,P.x,P.y,3)<0)kill('wall');
   for(i=0;i<POP.length;i++)if(POP[i].t>0){POP[i].t-=dt;POP[i].y-=8*dt;}
   Snd.music(dt);
 }
@@ -788,15 +788,6 @@ function seg(x,y,d,u,v,w,h){ // rectangle given in an "up-pointing" frame, rotat
   else if(d===1)cx.fillRect(x+v,y+u,h,w);
   else cx.fillRect(x+11-v-h,y+u,h,w);
 }
-function drawBanner(){
-  if(!(G.warn||G.ho>0))return;
-  var nd=G.warn?G.nextDir:G.dir,blink=((G.anim*6)|0)&1,y0=HUD+((VH/2)|0)-18,col=blink?'#ffe600':'#ffffff';
-  cx.fillStyle='rgba(0,0,0,0.78)';cx.fillRect(8,y0,W-16,38);
-  cx.fillStyle=col;cx.fillRect(8,y0,W-16,1);cx.fillRect(8,y0+37,W-16,1);
-  txtC('SCROLL '+DN[nd],y0+5,col,2);
-  var sh=((G.anim*8)|0)%3,i;
-  for(i=0;i<3;i++)arrow(((W-47)/2|0)+i*18,y0+22,nd,i===sh?'#ffffff':(blink?'#ffe600':'#a08800'));
-}
 function drawHUD(){
   cx.fillStyle='#000';cx.fillRect(0,0,W,HUD);
   cx.fillStyle='#202060';cx.fillRect(0,HUD-1,W,1);
@@ -806,7 +797,7 @@ function drawHUD(){
   txt(G.hiStr,hx,6,G.score>=G.hi&&G.score>0?'#ffe600':'#ffffff');
   var n=G.lives>0?G.lives:0,lx=((W-n*9)/2)|0;
   for(var i=0;i<n;i++)cx.drawImage(GH[0][3][0],0,0,10,10,lx+i*9,1,10,10);
-  arrow(100,0,G.warn?G.nextDir:G.dir,G.warn?(((G.anim*8)|0)&1?'#ffe600':'#664400'):'#4a5aff');
+  arrow(100,0,G.dir,'#4a5aff');
   if(G.scare>0){cx.fillStyle='#a040ff';cx.fillRect(0,HUD-2,Math.round(W*G.scare/(7.5-3.5*G.diff)),1);}
 }
 function drawPopups(){
@@ -838,7 +829,7 @@ function drawTitle(){
     txt(lg[i],28,126+i*13,COLORS[i]);
   }
   panel(178,78,0.7);
-  var help=['EAT DOTS. DODGE THE PAC-MEN!','POWER PELLET: EAT THEM BACK!','GLITCH WALL PUSHES FROM BEHIND.','TOUCH IT OR GET CAUGHT = LOSE A LIFE','EVERY 30 SEC THE SCROLL TURNS:','UP, DOWN, LEFT OR RIGHT. THE WALL','MOVES TO THE SIDE THAT PUSHES YOU!','3 LIVES. EXTRA LIFE PER 5000 PTS.','SWIPE / ARROWS / WASD / D-PAD','P OR ESC: PAUSE   M: MUTE'];
+  var help=['EAT DOTS. DODGE THE PAC-MEN!','POWER PELLET: EAT THEM BACK!','GLITCH WALL PUSHES FROM BEHIND.','TOUCH IT OR GET CAUGHT = LOSE A LIFE','EVERY 15 SEC THE SCROLL TURNS:','UP, DOWN, LEFT OR RIGHT. THE WALL','MOVES TO THE SIDE THAT PUSHES YOU!','3 LIVES. EXTRA LIFE PER 5000 PTS.','SWIPE / ARROWS / WASD / D-PAD','P OR ESC: PAUSE   M: MUTE'];
   for(i=0;i<help.length;i++)txtC(help[i],181+i*7.5|0,i<4||i===7?'#ffffff':(i<7?'#00ffff':'#ffe600'),1);
   if(((t*2)|0)&1)txtC('TAP OR PRESS SPACE TO START',259,'#ffe600',1);
   txtC('HI '+G.hi,267,'#8888cc',1);
@@ -872,7 +863,6 @@ function render(){
       for(k=0;k<14;k++){cx.fillStyle=GCOL[(fr()*6)|0];cx.fillRect(0,HUD+((fr()*VH)|0),W,1+((fr()*2)|0));}
       for(k=0;k<6;k++){var yy=HUD+((fr()*VH)|0),hh=2+((fr()*6)|0);cx.drawImage(cv,0,yy,W,hh,((fr()*21)|0)-10,yy,W,hh);}
     }
-    drawBanner();
     if(G.state==='pause')drawPause();
     else if(G.state==='over')drawOver();
   }else{
