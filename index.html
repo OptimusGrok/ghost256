@@ -217,7 +217,7 @@ function txtC(s,y,col,sc){sc=sc||1;txt(s,((W-txtW(s,sc))/2)|0,y,col,sc);}
 
 // pac-man sprites: PAC[mode][color][dir][frame]; mode 0 normal, 1 scared blue, 2 scared white
 var PAC=[[],[],[]];
-var MOUTH=[0,0.55,0.98];
+var MOUTH=[0,0.5,0.82];
 function mkPac(col,dir,f,mode){
   var m=mk(10,10),c=m[0],x=m[1],ang=[-Math.PI/2,Math.PI,Math.PI/2,0][dir];
   var body=mode===0?col:(mode===1?'#3b66ff':'#f4f4ff');
